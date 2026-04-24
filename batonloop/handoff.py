@@ -27,6 +27,10 @@ _INTERRUPTION_PATTERNS = (
     "quota exceeded",
     "temporarily unavailable",
 )
+_GENERIC_SUCCESS_RESULTS = {
+    "completed successfully",
+    "success",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,47 +232,45 @@ def extract_handoff_summary(
     interruption_message: str | None = None
 
     try:
-        with log_path.open(encoding="utf-8", errors="replace") as handle:
-            for raw_line in handle:
-                line = raw_line.strip()
-                if not line:
-                    continue
-
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    if interruption_message is None and _is_interruption_text(line):
-                        interruption_message = _clean_text(line)
-                    continue
-
-                if not isinstance(payload, dict):
-                    continue
-
-                for text in _extract_progress_messages(payload):
-                    if _is_interruption_text(text):
-                        interruption_message = _clean_text(text)
-                        continue
-                    messages.append(text)
-
-                for text in _extract_user_messages(payload):
-                    if _is_interruption_text(text):
-                        interruption_message = _clean_text(text)
-                        continue
-                    fallback_user_messages.append(text)
-
-                task_snapshot = _extract_task_snapshot(payload)
-                if task_snapshot is not None:
-                    tasks.append(task_snapshot)
-
-                todo_candidate = _extract_todo_snapshot(payload)
-                if todo_candidate is not None:
-                    todo_snapshot = todo_candidate
-
-                interruption_candidate = _extract_interruption_message(payload)
-                if interruption_candidate is not None:
-                    interruption_message = interruption_candidate
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+
+    whole_payloads = _load_whole_log_payloads(log_text)
+    if whole_payloads is not None:
+        for payload in whole_payloads:
+            todo_snapshot, interruption_message = _consume_summary_payload(
+                payload,
+                messages=messages,
+                fallback_user_messages=fallback_user_messages,
+                tasks=tasks,
+                todo_snapshot=todo_snapshot,
+                interruption_message=interruption_message,
+            )
+    else:
+        for raw_line in log_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                if interruption_message is None and _is_interruption_text(line):
+                    interruption_message = _clean_text(line)
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            todo_snapshot, interruption_message = _consume_summary_payload(
+                payload,
+                messages=messages,
+                fallback_user_messages=fallback_user_messages,
+                tasks=tasks,
+                todo_snapshot=todo_snapshot,
+                interruption_message=interruption_message,
+            )
 
     return _render_handoff_summary(
         messages=messages,
@@ -379,6 +381,59 @@ def _load_metadata(path: Path) -> dict[str, object] | None:
     return None
 
 
+def _load_whole_log_payloads(text: str) -> tuple[dict[str, object], ...] | None:
+    stripped = text.strip()
+    if not stripped:
+        return ()
+
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+    if isinstance(payload, dict):
+        return (payload,)
+    if isinstance(payload, list):
+        return tuple(item for item in payload if isinstance(item, dict))
+    return ()
+
+
+def _consume_summary_payload(
+    payload: dict[str, object],
+    *,
+    messages: list[str],
+    fallback_user_messages: list[str],
+    tasks: deque[_TaskSnapshot],
+    todo_snapshot: _TodoSnapshot | None,
+    interruption_message: str | None,
+) -> tuple[_TodoSnapshot | None, str | None]:
+    for text in _extract_progress_messages(payload):
+        if _is_interruption_text(text):
+            interruption_message = _clean_text(text)
+            continue
+        messages.append(text)
+
+    for text in _extract_user_messages(payload):
+        if _is_interruption_text(text):
+            interruption_message = _clean_text(text)
+            continue
+        fallback_user_messages.append(text)
+
+    task_snapshot = _extract_task_snapshot(payload)
+    if task_snapshot is not None:
+        tasks.append(task_snapshot)
+
+    todo_candidate = _extract_todo_snapshot(payload)
+    if todo_candidate is not None:
+        todo_snapshot = todo_candidate
+
+    interruption_candidate = _extract_interruption_message(payload)
+    if interruption_candidate is not None:
+        interruption_message = interruption_candidate
+
+    return todo_snapshot, interruption_message
+
+
 def _extract_progress_messages(payload: dict[str, object]) -> tuple[str, ...]:
     payload_type = payload.get("type")
     if payload_type == "assistant":
@@ -398,6 +453,16 @@ def _extract_progress_messages(payload: dict[str, object]) -> tuple[str, ...]:
             and isinstance(item.get("text"), str)
         ):
             return (_clean_text(item["text"]),)
+
+    if payload_type == "result":
+        result_text = _clean_optional_text(payload.get("result"))
+        if (
+            result_text is not None
+            and payload.get("is_error") is not True
+            and not _is_interruption_text(result_text)
+            and not _is_generic_success_result_text(result_text)
+        ):
+            return (result_text,)
 
     return ()
 
@@ -499,7 +564,12 @@ def _extract_interruption_message(payload: dict[str, object]) -> str | None:
             return _clean_optional_text(error_payload.get("message"))
 
     if payload_type == "result":
-        return _clean_optional_text(payload.get("result"))
+        result_text = _clean_optional_text(payload.get("result"))
+        if result_text is None:
+            return None
+        if payload.get("is_error") is True or _is_interruption_text(result_text):
+            return result_text
+        return None
 
     if payload_type == "rate_limit_event":
         rate_limit_info = payload.get("rate_limit_info")
@@ -708,6 +778,10 @@ def _score_goal_message(text: str) -> float:
 def _is_interruption_text(text: str) -> bool:
     lowered = text.lower()
     return any(token in lowered for token in _INTERRUPTION_PATTERNS)
+
+
+def _is_generic_success_result_text(text: str) -> bool:
+    return text.lower() in _GENERIC_SUCCESS_RESULTS
 
 
 def _clean_text(text: str) -> str:

@@ -192,7 +192,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show config and exit.",
     )
+    subparsers = parser.add_subparsers(dest="command")
+    handoff_parser = subparsers.add_parser(
+        "handoff-summary",
+        help="Print the extracted resume handoff summary for an iteration log.",
+        description="Print the extracted resume handoff summary for an iteration log.",
+    )
+    _add_handoff_summary_arguments(handoff_parser)
     return parser
+
+
+def _add_handoff_summary_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "resume_source",
+        help=(
+            "Iteration log, iteration artifact, or BatonLoop log directory to summarize."
+        ),
+    )
 
 
 def build_handoff_summary_parser() -> argparse.ArgumentParser:
@@ -200,21 +216,16 @@ def build_handoff_summary_parser() -> argparse.ArgumentParser:
         prog="batonloop handoff-summary",
         description="Print the extracted resume handoff summary for an iteration log.",
     )
-    parser.add_argument(
-        "resume_source",
-        help=(
-            "Iteration log, iteration artifact, or BatonLoop log directory to summarize."
-        ),
-    )
+    _add_handoff_summary_arguments(parser)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     argv = tuple(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-    if argv and argv[0] == "handoff-summary":
-        parser = build_handoff_summary_parser()
-        args = parser.parse_args(argv[1:])
+    if args.command == "handoff-summary":
         try:
             resume_context = resolve_resume_context(
                 resolve_path(Path(args.resume_source).expanduser(), Path.cwd())
@@ -224,9 +235,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(resume_context.previous_handoff_summary or "<no summary>")
         return 0
-
-    parser = build_parser()
-    args = parser.parse_args(argv)
 
     try:
         config = build_config(args)

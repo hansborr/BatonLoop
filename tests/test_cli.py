@@ -81,6 +81,15 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertIn("Phase 5.0", stdout.getvalue())
 
+    def test_main_help_lists_handoff_summary_command(self) -> None:
+        stdout = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(stdout):
+                main(["--help"])
+
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("handoff-summary", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

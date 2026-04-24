@@ -253,6 +253,75 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("Interruption: You've hit your limit - resets 7am.", summary)
             self.assertLessEqual(len(summary.split()), 120)
 
+    def test_extract_handoff_summary_from_successful_claude_result_log(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000001.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Phase 5.0 is the next recommended task.",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "subtype": "success",
+                                "is_error": False,
+                                "result": "Completed successfully",
+                                "total_cost_usd": 0.42,
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="claude")
+
+            assert summary is not None
+            self.assertIn("Goal: Phase 5.0 is the next recommended task.", summary)
+            self.assertNotIn("Completed successfully", summary)
+            self.assertNotIn("Interruption:", summary)
+
+    def test_extract_handoff_summary_from_claude_json_log(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000001.json"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": (
+                            "Phase 5.0 is the next recommended task. "
+                            "Lint and tests pass."
+                        ),
+                        "total_cost_usd": 0.03,
+                        "session_id": "abc123",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="claude")
+
+            assert summary is not None
+            self.assertIn("Previous iteration summary:", summary)
+            self.assertIn("Goal: Phase 5.0 is the next recommended task.", summary)
+            self.assertNotIn("Interruption:", summary)
+
     def test_extract_handoff_summary_from_codex_log(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             log_path = Path(tmp_dir) / "iteration-000002.json"
