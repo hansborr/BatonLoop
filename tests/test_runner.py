@@ -437,12 +437,34 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(metadata["handoff_summary"], None)
             self.assertIn("git_status", metadata)
 
+    def test_failed_iterations_count_toward_iteration_limit(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(temp_root, max_iterations=3, max_consecutive_errors=5)
+            provider = StaticCommandProvider(
+                [sys.executable, "-c", "import sys; print('boom'); sys.exit(1)"],
+            )
+
+            exit_code = run_loop(config, {"fake": provider})
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((config.log_dir / "iteration-000001.json").is_file())
+            self.assertTrue((config.log_dir / "iteration-000002.json").is_file())
+            self.assertTrue((config.log_dir / "iteration-000003.json").is_file())
+            self.assertFalse((config.log_dir / "iteration-000004.json").exists())
+
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
+            self.assertIn("STOP: Iteration limit reached (3)", log_text)
+            self.assertIn("Attempts:    3", log_text)
+            self.assertIn("Completed:   0", log_text)
+            self.assertNotIn("FATAL: 5 consecutive errors. Stopping.", log_text)
+
     def test_rate_limit_failure_automatically_fails_over_to_next_provider(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
             config = _make_config(
                 temp_root,
-                max_iterations=1,
+                max_iterations=2,
                 provider_names=("limited", "backup"),
                 provider_profiles={"backup": ProviderProfile(model="gpt-5.4")},
             )
@@ -475,6 +497,33 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("Current provider: backup", second_log_text)
             self.assertIn("Previous provider: limited", second_log_text)
             self.assertIn("Previous iteration summary:", second_log_text)
+
+    def test_failover_respects_iteration_limit(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=1,
+                provider_names=("limited", "backup"),
+                provider_profiles={"backup": ProviderProfile(model="gpt-5.4")},
+            )
+            providers = {
+                "limited": RateLimitedProvider(),
+                "backup": ResumeEchoProvider(),
+            }
+
+            exit_code = run_loop(config, providers)
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((config.log_dir / "iteration-000001.json").is_file())
+            self.assertFalse((config.log_dir / "iteration-000002.json").exists())
+
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
+            self.assertNotIn("AUTO FAILOVER: Switching provider from limited to backup.", log_text)
+            self.assertIn("Iteration limit reached before another retry.", log_text)
+            self.assertIn("STOP: Iteration limit reached (1)", log_text)
+            self.assertIn("Attempts:    1", log_text)
+            self.assertIn("Completed:   0", log_text)
 
 
 class StaticCommandProvider:

@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="max_iterations",
         type=parse_non_negative_int,
         default=0,
-        help="Max iterations. Use 0 for unlimited.",
+        help="Max provider-run attempts, including failed iterations. Use 0 for unlimited.",
     )
     parser.add_argument(
         "-c",

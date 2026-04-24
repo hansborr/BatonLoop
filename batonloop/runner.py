@@ -28,7 +28,7 @@ from .providers.utils import read_log_text
 @dataclass(slots=True)
 class RunState:
     start_time: float
-    iteration: int = 0
+    attempted_iterations: int = 0
     completed_iterations: int = 0
     total_cost: Decimal = field(default_factory=lambda: Decimal("0"))
     consecutive_errors: int = 0
@@ -122,9 +122,10 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
             return 0
 
         while True:
-            state.iteration += 1
-
-            if config.max_iterations and state.completed_iterations >= config.max_iterations:
+            if (
+                config.max_iterations
+                and state.attempted_iterations >= config.max_iterations
+            ):
                 logger.info("STOP: Iteration limit reached (%s)", config.max_iterations)
                 break
 
@@ -135,10 +136,12 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
             if not _check_duration(logger, config, state):
                 break
 
+            state.attempted_iterations += 1
+            iteration_number = state.attempted_iterations
             current_slot = provider_slots[current_provider_index]
             logger.info(
                 "--- Iteration %s starting with provider %s ---",
-                state.iteration,
+                iteration_number,
                 current_slot.execution.name,
             )
 
@@ -158,7 +161,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                     current_prompt.name,
                 )
 
-            iteration_log = config.log_dir / f"iteration-{state.iteration:06d}.json"
+            iteration_log = config.log_dir / f"iteration-{iteration_number:06d}.json"
             prompt_input_path = _prepare_iteration_prompt(
                 config=config,
                 provider_execution=current_slot.execution,
@@ -191,12 +194,12 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 state.consecutive_errors += 1
                 failure_message = (
                     "Iteration "
-                    f"{state.iteration} timed out after "
+                    f"{iteration_number} timed out after "
                     f"{_format_minutes_limit(config.iteration_timeout_minutes)} and was terminated."
                 )
                 logger.warning(
                     "Iteration %s timed out after %s and was terminated.",
-                    state.iteration,
+                    iteration_number,
                     _format_minutes_limit(config.iteration_timeout_minutes),
                 )
 
@@ -211,7 +214,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 success = True
                 state.consecutive_errors = 0
                 state.completed_iterations += 1
-                logger.info("Iteration %s completed successfully.", state.iteration)
+                logger.info("Iteration %s completed successfully.", iteration_number)
 
                 iteration_cost = current_slot.provider.extract_cost(
                     iteration_log,
@@ -229,7 +232,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                     logger=logger,
                     config=config,
                     controller=controller,
-                    iteration=state.iteration,
+                    iteration=iteration_number,
                     iteration_log=iteration_log,
                 )
 
@@ -254,11 +257,19 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                     config,
                     current_slot.execution,
                 )
-                failure_message = decision.message
                 next_provider_index = current_provider_index + 1
-                can_failover = decision.should_failover and next_provider_index < len(provider_slots)
+                has_remaining_attempt_budget = (
+                    config.max_iterations == 0
+                    or state.attempted_iterations < config.max_iterations
+                )
+                can_failover = (
+                    decision.should_failover
+                    and next_provider_index < len(provider_slots)
+                    and has_remaining_attempt_budget
+                )
 
                 if can_failover:
+                    failure_message = decision.message
                     failover_target_provider = provider_slots[next_provider_index].execution.name
                     logger.warning(decision.message)
                     logger.info(
@@ -268,25 +279,42 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                     )
                     switched_provider = True
                 elif decision.fatal:
+                    failure_message = decision.message
                     logger.error(decision.message)
                     exit_status = 1
                     stop_reason = decision.message
                     should_break = True
                 else:
                     state.consecutive_errors += 1
-                    logger.warning(decision.message)
-
                     if state.consecutive_errors >= config.max_consecutive_errors:
+                        failure_message = decision.message
+                        logger.warning(failure_message)
                         stop_reason = (
                             f"FATAL: {config.max_consecutive_errors} consecutive errors. Stopping."
                         )
                         logger.error(stop_reason)
                         exit_status = 1
                         should_break = True
-                    else:
+                    elif has_remaining_attempt_budget:
+                        failure_message = decision.message
+                        logger.warning(failure_message)
                         wait_seconds = decision.wait_seconds
                         reset_error_count = decision.reset_error_count
                         skip_pause_after_wait = decision.skip_pause
+                    else:
+                        failure_message = (
+                            f"{decision.message} Iteration limit reached before another retry."
+                        )
+                        logger.warning(failure_message)
+
+            if (
+                not should_break
+                and config.max_iterations
+                and state.attempted_iterations >= config.max_iterations
+            ):
+                stop_reason = f"STOP: Iteration limit reached ({config.max_iterations})"
+                logger.info(stop_reason)
+                should_break = True
 
             write_iteration_metadata(
                 log_path=iteration_log,
@@ -336,7 +364,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
             if controller.stop_requested:
                 logger.info(
                     "STOP: Graceful shutdown requested after iteration %s.",
-                    state.iteration,
+                    iteration_number,
                 )
                 break
 
@@ -451,7 +479,7 @@ def _log_startup(
         for index, prompt_path in enumerate(config.prompt_sequence, start=1):
             logger.info("  [%s/%s] %s", index, len(config.prompt_sequence), prompt_path)
 
-    logger.info("Max iterations:  %s", _format_limit(config.max_iterations))
+    logger.info("Max attempts:    %s", _format_limit(config.max_iterations))
     logger.info("Max cost:        %s", _format_money_limit(config.max_cost))
     logger.info("Max duration:    %s", _format_duration_limit(config.max_duration_hours))
     logger.info("Iter timeout:    %s", _format_minutes_limit(config.iteration_timeout_minutes))
@@ -489,7 +517,8 @@ def _log_cleanup(logger: logging.Logger, config: RunnerConfig, state: RunState) 
     elapsed_seconds = max(0, int(time.monotonic() - state.start_time))
     elapsed_minutes = elapsed_seconds // 60
     logger.info("=== BatonLoop Complete ===")
-    logger.info("Iterations:  %s", state.completed_iterations)
+    logger.info("Attempts:    %s", state.attempted_iterations)
+    logger.info("Completed:   %s", state.completed_iterations)
     logger.info("Total cost:  $%s", _format_decimal(state.total_cost))
     logger.info("Elapsed:     %s minutes", elapsed_minutes)
     logger.info("Logs:        %s/", config.log_dir)

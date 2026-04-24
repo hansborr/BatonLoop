@@ -66,6 +66,7 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 - `codex` currently supports `stream-json` only; `--no-stream` is rejected for that provider.
 - `codex` does not expose explicit cost data in the local JSON stream today, so cost tracking remains `0` unless the CLI starts emitting cost fields.
 - Repeat `--provider` to define failover order. BatonLoop keeps using the current provider until it hits an eligible failover condition or you stop the loop.
+- `--iterations` caps total provider-run attempts, including failed, timed-out, and auto-failover attempts. Prompt rotation still advances on successful iterations so interrupted work resumes the same prompt.
 - `--check` commands are run with the current shell and stop the loop when all configured checks pass.
 - `--stop-on-clean-git` ignores the configured log directory so BatonLoop's own log files do not keep the repo dirty.
 - `--resume-from` accepts either an `iteration-*.json` log or a BatonLoop log directory. BatonLoop resolves that to a prior iteration, writes per-iteration `.meta.json` artifacts, extracts a compact summary from the prior log when possible, and appends a generated handoff block to each resumed prompt.
