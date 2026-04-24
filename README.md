@@ -64,6 +64,7 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 ## Notes
 
 - `codex` currently supports `stream-json` only; `--no-stream` is rejected for that provider.
+- Filtered live provider output is enabled by default for normal runs. Use `--no-live-output` to keep the console quiet while still writing the raw iteration log.
 - `codex` does not expose explicit cost data in the local JSON stream today, so cost tracking remains `0` unless the CLI starts emitting cost fields.
 - Repeat `--provider` to define failover order. BatonLoop keeps using the current provider until it hits an eligible failover condition or you stop the loop.
 - `--iterations` caps total provider-run attempts, including failed, timed-out, and auto-failover attempts. Prompt rotation still advances on successful iterations so interrupted work resumes the same prompt.

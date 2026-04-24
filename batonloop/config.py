@@ -63,6 +63,7 @@ class RunnerConfig:
     stop_on_clean_git: bool
     stop_when_files: tuple[Path, ...]
     output_format: OutputFormat
+    live_output: bool
     resume_from: Path | None
     resume_note: str | None
     dry_run: bool
@@ -217,6 +218,7 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         stop_on_clean_git=args.stop_on_clean_git,
         stop_when_files=stop_when_files,
         output_format=output_format,
+        live_output=args.live_output,
         resume_from=resume_from,
         resume_note=args.resume_note or None,
         dry_run=args.dry_run,

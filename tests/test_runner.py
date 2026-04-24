@@ -90,6 +90,34 @@ class RunnerTests(unittest.TestCase):
             log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
             self.assertIn("Stop file detected", log_text)
 
+    def test_live_output_logs_filtered_provider_messages_by_default(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(temp_root, max_iterations=1)
+            provider = StaticCommandProvider(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json; "
+                        "print('Reading prompt from stdin...'); "
+                        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Planning the refactor.'}})); "
+                        "print(json.dumps({'type':'item.updated','item':{'type':'todo_list','items':[{'text':'Implement live output','completed':True},{'text':'Run tests','completed':False}]}}))"
+                    ),
+                ],
+            )
+
+            exit_code = run_loop(config, {"fake": provider})
+
+            self.assertEqual(exit_code, 0)
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
+            self.assertIn("[fake] Planning the refactor.", log_text)
+            self.assertIn(
+                "[fake] Checklist: 1/2 complete; remaining: Run tests",
+                log_text,
+            )
+            self.assertNotIn("Reading prompt from stdin...", log_text)
+
     def test_stop_on_clean_git_ignores_log_directory(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
@@ -650,6 +678,7 @@ def _make_config(
     resume_note: str | None = None,
     provider_names: tuple[str, ...] = ("fake",),
     provider_profiles: dict[str, ProviderProfile] | None = None,
+    live_output: bool = True,
 ) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
@@ -675,6 +704,7 @@ def _make_config(
         stop_on_clean_git=stop_on_clean_git,
         stop_when_files=stop_when_files,
         output_format=OutputFormat.STREAM_JSON,
+        live_output=live_output,
         resume_from=resume_from,
         resume_note=resume_note,
         dry_run=False,

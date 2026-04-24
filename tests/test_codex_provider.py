@@ -162,6 +162,7 @@ def _make_config(
         stop_on_clean_git=False,
         stop_when_files=(),
         output_format=output_format,
+        live_output=True,
         resume_from=None,
         resume_note=None,
         dry_run=False,

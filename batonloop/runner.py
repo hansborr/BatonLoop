@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from .handoff import (
     resolve_resume_context,
     write_iteration_metadata,
 )
+from .live_output import LiveOutputConsumer
 from .providers.base import Provider
 from .providers.utils import read_log_text
 
@@ -44,6 +46,37 @@ class CommandResult:
 class ProviderSlot:
     provider: Provider
     execution: ProviderExecution
+
+
+class _OutputPump(threading.Thread):
+    def __init__(
+        self,
+        *,
+        process: subprocess.Popen[bytes],
+        log_handle: object,
+        consumer: LiveOutputConsumer,
+    ) -> None:
+        super().__init__(daemon=True)
+        self._process = process
+        self._log_handle = log_handle
+        self._consumer = consumer
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        try:
+            if self._process.stdout is None:
+                return
+
+            with self._process.stdout:
+                while True:
+                    chunk = self._process.stdout.readline()
+                    if not chunk:
+                        break
+                    self._log_handle.write(chunk)
+                    self._log_handle.flush()
+                    self._consumer.consume_line(chunk.decode("utf-8", errors="replace"))
+        except BaseException as exc:  # pragma: no cover - defensive thread handoff
+            self.error = exc
 
 
 class StopController:
@@ -487,6 +520,7 @@ def _log_startup(
     logger.info("Rate limit wait: %sm", config.wait_on_limit_mins)
     logger.info("Max errors:      %s", config.max_consecutive_errors)
     logger.info("Output format:   %s", config.output_format.value)
+    logger.info("Live output:     %s", config.live_output)
     logger.info("Resume from:     %s", config.resume_from if config.resume_from else "none")
     logger.info("Resume note:     %s", config.resume_note or "none")
     logger.info("Log directory:   %s", config.log_dir)
@@ -561,6 +595,11 @@ def _run_iteration(
         log_path=log_path,
         stdin_path=prompt_path,
         timeout_seconds=_timeout_seconds(config),
+        live_output_consumer=(
+            LiveOutputConsumer(logging.getLogger("batonloop"), execution.name)
+            if config.live_output
+            else None
+        ),
     )
 
 
@@ -714,9 +753,9 @@ def _run_subprocess(
     stdin_path: Path | None = None,
     shell: bool = False,
     timeout_seconds: float | None = None,
+    live_output_consumer: LiveOutputConsumer | None = None,
 ) -> CommandResult:
     popen_kwargs: dict[str, object] = {
-        "stdout": None,
         "stderr": subprocess.STDOUT,
         "start_new_session": True,
         "cwd": cwd,
@@ -732,8 +771,19 @@ def _run_subprocess(
             popen_kwargs["stdin"] = stdin_handle
 
         with log_path.open("wb") as log_handle:
-            popen_kwargs["stdout"] = log_handle
+            if live_output_consumer is None:
+                popen_kwargs["stdout"] = log_handle
+            else:
+                popen_kwargs["stdout"] = subprocess.PIPE
             process = subprocess.Popen(command, **popen_kwargs)
+            output_pump = None
+            if live_output_consumer is not None:
+                output_pump = _OutputPump(
+                    process=process,
+                    log_handle=log_handle,
+                    consumer=live_output_consumer,
+                )
+                output_pump.start()
             controller.attach_process(process)
             try:
                 started_at = time.monotonic()
@@ -752,6 +802,10 @@ def _run_subprocess(
                         continue
             finally:
                 controller.detach_process()
+                if output_pump is not None:
+                    output_pump.join()
+                    if output_pump.error is not None:
+                        raise output_pump.error
     finally:
         if stdin_handle is not None:
             stdin_handle.close()

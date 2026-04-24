@@ -65,6 +65,7 @@ class PromptSpecTests(unittest.TestCase):
                     stop_when_files=[str(temp_root / "done.flag")],
                     output_format=OutputFormat.STREAM_JSON.value,
                     no_stream=False,
+                    live_output=False,
                     bare=None,
                     safe=None,
                     resume_from=str(temp_root / "old-logs"),
@@ -78,6 +79,7 @@ class PromptSpecTests(unittest.TestCase):
                 (prompt_path, prompt_path, review_path),
             )
             self.assertEqual(config.output_format, OutputFormat.STREAM_JSON)
+            self.assertFalse(config.live_output)
             self.assertEqual(config.iteration_timeout_minutes, Decimal("0"))
             self.assertEqual(config.check_commands, ("pytest -q",))
             self.assertEqual(config.stop_on_regexes, ("DONE",))

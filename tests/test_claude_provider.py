@@ -105,6 +105,7 @@ def _make_config(temp_root: Path) -> RunnerConfig:
         stop_on_clean_git=False,
         stop_when_files=(),
         output_format=OutputFormat.STREAM_JSON,
+        live_output=True,
         resume_from=None,
         resume_note=None,
         dry_run=False,

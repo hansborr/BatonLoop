@@ -164,6 +164,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shortcut for --output-format json.",
     )
     parser.add_argument(
+        "--live-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show filtered live provider progress in the console and BatonLoop log.",
+    )
+    parser.add_argument(
         "--bare",
         action="store_true",
         default=None,
