@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ralph-loop"
+name = "batonloop"
 version = "0.1.0"
-description = "Run AI coding agents in a controllable loop."
+description = "Run AI coding agents in a controllable resumable loop."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -13,8 +13,7 @@ authors = [
 ]
 
 [project.scripts]
-ralph = "ralph.cli:main"
+batonloop = "batonloop.cli:main"
 
 [tool.setuptools]
-packages = ["ralph", "ralph.providers"]
-
+packages = ["batonloop", "batonloop.providers"]

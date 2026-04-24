@@ -187,8 +187,8 @@ def _render_resume_block(
     resume_note: str | None,
 ) -> str:
     lines = [
-        "=== RALPH RESUME CONTEXT ===",
-        "You are resuming work from a previous Ralph loop iteration.",
+        "=== BATONLOOP RESUME CONTEXT ===",
+        "You are resuming work from a previous BatonLoop iteration.",
         "Treat the repository as potentially containing partial in-progress changes.",
         f"Current provider: {current_provider_name}",
         f"Previous raw log: {resume_context.source_log_path}",
@@ -211,10 +211,10 @@ def _render_resume_block(
 
     git_status = get_git_status_snapshot(working_dir, log_dir)
     if git_status:
-        lines.append("Current git status (excluding Ralph logs):")
+        lines.append("Current git status (excluding BatonLoop logs):")
         lines.extend(git_status)
     else:
-        lines.append("Current git status (excluding Ralph logs): clean or unavailable.")
+        lines.append("Current git status (excluding BatonLoop logs): clean or unavailable.")
 
     if resume_note:
         lines.append(f"Operator note: {resume_note}")
@@ -222,7 +222,7 @@ def _render_resume_block(
     lines.append(
         "Inspect the current worktree and previous artifacts if you need more detail before changing direction."
     )
-    lines.append("=== END RALPH RESUME CONTEXT ===")
+    lines.append("=== END BATONLOOP RESUME CONTEXT ===")
     return "\n".join(lines)
 
 
@@ -240,7 +240,7 @@ def _resolve_resume_log_path(path: Path) -> Path:
     stem_match = _ITERATION_ARTIFACT_STEM.match(path.name)
     if stem_match is None:
         raise ValueError(
-            "Resume source must be an iteration log, an iteration artifact, or a Ralph log directory."
+            "Resume source must be an iteration log, an iteration artifact, or a BatonLoop log directory."
         )
 
     derived_log_path = path.with_name(f"{stem_match.group(1)}.json")

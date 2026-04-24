@@ -107,7 +107,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
         resolve_resume_context(config.resume_from) if config.resume_from is not None else None
     )
 
-    logger = _configure_logger(config.log_dir / "ralph.log")
+    logger = _configure_logger(config.log_dir / "batonloop.log")
     controller = StopController(logger)
     state = RunState(start_time=time.monotonic())
     exit_status = 0
@@ -351,7 +351,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
 
 
 def _configure_logger(log_path: Path) -> logging.Logger:
-    logger = logging.getLogger("ralph")
+    logger = logging.getLogger("batonloop")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
@@ -421,7 +421,7 @@ def _log_startup(
     config: RunnerConfig,
     provider_slots: tuple[ProviderSlot, ...],
 ) -> None:
-    logger.info("=== Ralph Loop Starting ===")
+    logger.info("=== BatonLoop Starting ===")
     logger.info(
         "Providers:       %s",
         " -> ".join(slot.execution.name for slot in provider_slots),
@@ -488,7 +488,7 @@ def _log_startup(
 def _log_cleanup(logger: logging.Logger, config: RunnerConfig, state: RunState) -> None:
     elapsed_seconds = max(0, int(time.monotonic() - state.start_time))
     elapsed_minutes = elapsed_seconds // 60
-    logger.info("=== Ralph Loop Complete ===")
+    logger.info("=== BatonLoop Complete ===")
     logger.info("Iterations:  %s", state.completed_iterations)
     logger.info("Total cost:  $%s", _format_decimal(state.total_cost))
     logger.info("Elapsed:     %s minutes", elapsed_minutes)

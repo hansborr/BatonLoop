@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ralph.config import OutputFormat, build_config, parse_prompt_spec, resolve_provider_execution
+from batonloop.config import OutputFormat, build_config, parse_prompt_spec, resolve_provider_execution
 
 
 class PromptSpecTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class PromptSpecTests(unittest.TestCase):
             temp_root = Path(tmp_dir)
             prompt_path = temp_root / "PROMPT.md"
             review_path = temp_root / "REVIEW.md"
-            provider_config_path = temp_root / "ralph-providers.toml"
+            provider_config_path = temp_root / "batonloop-providers.toml"
             prompt_path.write_text("develop", encoding="utf-8")
             review_path.write_text("review", encoding="utf-8")
             provider_config_path.write_text(

@@ -21,7 +21,7 @@ PROVIDERS = {
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ralph",
+        prog="batonloop",
         description="Run AI coding agents in a loop.",
     )
 
@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider-config",
         help=(
-            "TOML file with per-provider settings. Defaults to ./ralph-providers.toml "
+            "TOML file with per-provider settings. Defaults to ./batonloop-providers.toml "
             "when that file exists."
         ),
     )
@@ -116,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-dir",
-        default="./ralph-logs",
+        default="./batonloop-logs",
         help="Directory for logs.",
     )
     parser.add_argument(
@@ -174,8 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume-from",
         help=(
-            "Previous iteration log or Ralph log directory to resume from. "
-            "Ralph appends a generated handoff block to each prompt so a new provider "
+            "Previous iteration log or BatonLoop log directory to resume from. "
+            "BatonLoop appends a generated handoff block to each prompt so a new provider "
             "can pick up interrupted work."
         ),
     )

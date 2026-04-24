@@ -9,10 +9,16 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ralph.config import OutputFormat, PromptSpec, ProviderExecution, ProviderProfile, RunnerConfig
-from ralph.handoff import metadata_path_for, prompt_artifact_path_for
-from ralph.providers.base import FailureDecision, FailureKind
-from ralph.runner import run_loop
+from batonloop.config import (
+    OutputFormat,
+    PromptSpec,
+    ProviderExecution,
+    ProviderProfile,
+    RunnerConfig,
+)
+from batonloop.handoff import metadata_path_for, prompt_artifact_path_for
+from batonloop.providers.base import FailureDecision, FailureKind
+from batonloop.runner import run_loop
 
 
 class RunnerTests(unittest.TestCase):
@@ -31,7 +37,7 @@ class RunnerTests(unittest.TestCase):
             exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 1)
-            log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
             self.assertIn("timed out", log_text.lower())
 
     def test_check_commands_stop_after_all_pass(self) -> None:
@@ -49,7 +55,7 @@ class RunnerTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertTrue((config.log_dir / "iteration-000001-check-01.log").is_file())
-            log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
             self.assertIn("All post-iteration checks passed", log_text)
 
     def test_stop_on_regex_matches_iteration_log(self) -> None:
@@ -61,7 +67,7 @@ class RunnerTests(unittest.TestCase):
             exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 0)
-            log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
             self.assertIn("Stop regex matched iteration output", log_text)
 
     def test_stop_when_file_detects_marker(self) -> None:
@@ -81,7 +87,7 @@ class RunnerTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertTrue(marker_path.exists())
-            log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
             self.assertIn("Stop file detected", log_text)
 
     def test_stop_on_clean_git_ignores_log_directory(self) -> None:
@@ -112,7 +118,7 @@ class RunnerTests(unittest.TestCase):
             exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 0)
-            log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
             self.assertIn("Git worktree is clean", log_text)
 
     def test_resume_from_directory_uses_latest_iteration_log(self) -> None:
@@ -152,7 +158,7 @@ class RunnerTests(unittest.TestCase):
             prompt_artifact = prompt_artifact_path_for(current_log)
             log_text = current_log.read_text(encoding="utf-8")
             self.assertTrue(prompt_artifact.is_file())
-            self.assertIn("=== RALPH RESUME CONTEXT ===", log_text)
+            self.assertIn("=== BATONLOOP RESUME CONTEXT ===", log_text)
             self.assertIn(f"Previous raw log: {latest_log}", log_text)
             self.assertIn("Previous provider: claude", log_text)
             self.assertIn("Previous exit code: 1", log_text)
@@ -215,7 +221,7 @@ class RunnerTests(unittest.TestCase):
             second_log_text = second_iteration_log.read_text(encoding="utf-8")
             self.assertTrue(second_prompt_artifact.is_file())
             self.assertIn("MODEL=gpt-5.4", second_log_text)
-            self.assertIn("=== RALPH RESUME CONTEXT ===", second_log_text)
+            self.assertIn("=== BATONLOOP RESUME CONTEXT ===", second_log_text)
             self.assertIn(
                 f"Previous raw log: {config.log_dir / 'iteration-000001.json'}",
                 second_log_text,
@@ -366,7 +372,7 @@ def _make_config(
         pause_seconds=0,
         wait_on_limit_mins=30,
         max_consecutive_errors=max_consecutive_errors,
-        log_dir=temp_root / "ralph-logs",
+        log_dir=temp_root / "batonloop-logs",
         log_retain=0,
         check_commands=check_commands,
         stop_on_regexes=stop_on_regexes,

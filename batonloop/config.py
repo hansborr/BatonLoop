@@ -237,9 +237,12 @@ def _resolve_provider_config_path(
             raise FileNotFoundError(f"Provider config not found: {config_path}")
         return config_path
 
-    default_path = working_dir / "ralph-providers.toml"
+    default_path = working_dir / "batonloop-providers.toml"
     if default_path.is_file():
         return default_path
+    legacy_default_path = working_dir / "ralph-providers.toml"
+    if legacy_default_path.is_file():
+        return legacy_default_path
     return None
 
 

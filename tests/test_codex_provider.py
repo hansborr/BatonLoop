@@ -6,14 +6,14 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ralph.config import (
+from batonloop.config import (
     OutputFormat,
     PromptSpec,
     ProviderProfile,
     RunnerConfig,
     resolve_provider_execution,
 )
-from ralph.providers import CodexProvider, FailureKind
+from batonloop.providers import CodexProvider, FailureKind
 
 
 class CodexProviderTests(unittest.TestCase):
