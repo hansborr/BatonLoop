@@ -79,8 +79,113 @@ class ClaudeProviderTests(unittest.TestCase):
         self.assertTrue(decision.skip_pause)
         self.assertTrue(decision.should_failover)
 
+    def test_classify_rate_limit_from_structured_stream_events(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            log_path = temp_root / "iteration-000001.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "rate_limit_event",
+                                "rate_limit_info": {
+                                    "status": "rejected",
+                                    "rateLimitType": "five_hour",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "error": "rate_limit",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "is_error": True,
+                                "api_error_status": 429,
+                                "result": "You've hit your limit. Try again later.",
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = _make_config(temp_root)
+            decision = self.provider.classify_failure(
+                exit_code=1,
+                log_path=log_path,
+                config=config,
+                execution=resolve_provider_execution(config, "claude"),
+            )
 
-def _make_config(temp_root: Path) -> RunnerConfig:
+        self.assertEqual(decision.kind, FailureKind.RATE_LIMIT)
+        self.assertEqual(decision.wait_seconds, 1800)
+        self.assertTrue(decision.reset_error_count)
+        self.assertTrue(decision.skip_pause)
+        self.assertTrue(decision.should_failover)
+
+    def test_classify_overload_from_structured_result(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            log_path = temp_root / "iteration-000001.json"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "is_error": True,
+                        "api_error_status": 529,
+                        "result": "Temporarily unavailable.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = _make_config(temp_root)
+            decision = self.provider.classify_failure(
+                exit_code=1,
+                log_path=log_path,
+                config=config,
+                execution=resolve_provider_execution(config, "claude"),
+            )
+
+        self.assertEqual(decision.kind, FailureKind.OVERLOADED)
+        self.assertEqual(decision.wait_seconds, 120)
+        self.assertTrue(decision.skip_pause)
+
+    def test_classify_rate_limit_from_json_output(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            log_path = temp_root / "iteration-000001.json"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "is_error": True,
+                        "api_error_status": 429,
+                        "result": "You've hit your limit. Try again later.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = _make_config(temp_root, output_format=OutputFormat.JSON)
+            decision = self.provider.classify_failure(
+                exit_code=1,
+                log_path=log_path,
+                config=config,
+                execution=resolve_provider_execution(config, "claude"),
+            )
+
+        self.assertEqual(decision.kind, FailureKind.RATE_LIMIT)
+        self.assertEqual(decision.wait_seconds, 1800)
+        self.assertTrue(decision.should_failover)
+
+
+def _make_config(
+    temp_root: Path,
+    *,
+    output_format: OutputFormat = OutputFormat.STREAM_JSON,
+) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
@@ -104,7 +209,7 @@ def _make_config(temp_root: Path) -> RunnerConfig:
         stop_on_regexes=(),
         stop_on_clean_git=False,
         stop_when_files=(),
-        output_format=OutputFormat.STREAM_JSON,
+        output_format=output_format,
         live_output=True,
         resume_from=None,
         resume_note=None,

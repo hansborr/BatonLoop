@@ -121,6 +121,37 @@ class CodexProviderTests(unittest.TestCase):
         self.assertEqual(decision.kind, FailureKind.INVALID_REQUEST)
         self.assertTrue(decision.should_failover)
 
+    def test_classify_usage_limit_from_structured_events_as_rate_limit(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            log_path = temp_root / "iteration-000001.json"
+            interruption = (
+                "You've hit your usage limit. Upgrade to Pro or try again later."
+            )
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "error", "message": interruption}),
+                        json.dumps({"type": "turn.failed", "error": {"message": interruption}}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = _make_config(temp_root)
+
+            decision = self.provider.classify_failure(
+                exit_code=1,
+                log_path=log_path,
+                config=config,
+                execution=resolve_provider_execution(config, "codex"),
+            )
+
+        self.assertEqual(decision.kind, FailureKind.RATE_LIMIT)
+        self.assertEqual(decision.wait_seconds, 1800)
+        self.assertTrue(decision.reset_error_count)
+        self.assertTrue(decision.skip_pause)
+        self.assertTrue(decision.should_failover)
+
 
 def _make_config(
     temp_root: Path,

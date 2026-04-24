@@ -6,7 +6,13 @@ from pathlib import Path
 
 from ..config import OutputFormat, ProviderExecution, RunnerConfig
 from .base import FailureDecision, FailureKind
-from .utils import decimal_from_value, iter_jsonl, read_log_text
+from .utils import (
+    decimal_from_value,
+    iter_jsonl,
+    read_jsonl_failure_summary,
+    read_log_text,
+    summarize_failure_payloads,
+)
 
 
 class ClaudeProvider:
@@ -85,10 +91,15 @@ class ClaudeProvider:
                 ),
             )
 
-        log_text = read_log_text(log_path, lower=True)
+        summary = _read_failure_summary(log_path, config.output_format)
 
         if exit_code == 1:
-            if any(pattern in log_text for pattern in ("rate.limit", "usage.limit", "rate_limit")):
+            if (
+                summary.rate_limit_rejected
+                or summary.has_status(429)
+                or summary.has_error_code("rate_limit", "rate.limit", "usage.limit")
+                or summary.matches_text(_RATE_LIMIT_PATTERNS)
+            ):
                 return FailureDecision(
                     kind=FailureKind.RATE_LIMIT,
                     message=(
@@ -101,7 +112,34 @@ class ClaudeProvider:
                     should_failover=True,
                 )
 
-            if any(pattern in log_text for pattern in ("overloaded", "529", "temporarily unavailable")):
+            if (
+                summary.has_status(500, 502, 503, 504, 529)
+                or summary.has_error_code("overloaded", "server_error")
+                or summary.matches_text(_OVERLOAD_PATTERNS)
+            ):
+                return FailureDecision(
+                    kind=FailureKind.OVERLOADED,
+                    message="API overloaded (529). Waiting 2 minutes before retrying...",
+                    wait_seconds=120,
+                    skip_pause=True,
+                )
+
+            log_text = read_log_text(log_path, lower=True)
+
+            if any(pattern in log_text for pattern in _RATE_LIMIT_PATTERNS):
+                return FailureDecision(
+                    kind=FailureKind.RATE_LIMIT,
+                    message=(
+                        "RATE LIMITED detected in output. "
+                        f"Waiting {config.wait_on_limit_mins} minutes before retrying..."
+                    ),
+                    wait_seconds=config.wait_on_limit_mins * 60,
+                    reset_error_count=True,
+                    skip_pause=True,
+                    should_failover=True,
+                )
+
+            if any(pattern in log_text for pattern in _OVERLOAD_PATTERNS):
                 return FailureDecision(
                     kind=FailureKind.OVERLOADED,
                     message="API overloaded (529). Waiting 2 minutes before retrying...",
@@ -116,3 +154,30 @@ class ClaudeProvider:
         return FailureDecision(
             message=f"WARNING: Unexpected exit code {exit_code}. Check {log_path} for details."
         )
+
+
+_RATE_LIMIT_PATTERNS = (
+    "rate.limit",
+    "usage.limit",
+    "rate_limit",
+    "usage limit",
+    "hit your limit",
+)
+
+_OVERLOAD_PATTERNS = (
+    "overloaded",
+    "temporarily unavailable",
+)
+
+
+def _read_failure_summary(log_path: Path, output_format: OutputFormat):
+    if output_format is OutputFormat.JSON:
+        try:
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return summarize_failure_payloads(())
+        if isinstance(payload, dict):
+            return summarize_failure_payloads((payload,))
+        return summarize_failure_payloads(())
+
+    return read_jsonl_failure_summary(log_path)

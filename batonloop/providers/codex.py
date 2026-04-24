@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 from ..config import OutputFormat, ProviderExecution, RunnerConfig
 from .base import FailureDecision, FailureKind
-from .utils import decimal_from_value, iter_jsonl, read_log_text
+from .utils import decimal_from_value, iter_jsonl, read_jsonl_failure_summary, read_log_text
 
 
 class CodexProvider:
@@ -73,6 +74,75 @@ class CodexProvider:
         execution: ProviderExecution,
     ) -> FailureDecision:
         del execution
+        summary = read_jsonl_failure_summary(log_path)
+
+        if summary.has_status(401, 403) or summary.matches_text(_AUTH_PATTERNS):
+            return FailureDecision(
+                kind=FailureKind.AUTH,
+                fatal=True,
+                should_failover=True,
+                message=(
+                    "FATAL: Authentication error. Run 'codex login' and verify the account "
+                    f"can access the requested model. Check {log_path} for details."
+                ),
+            )
+
+        if (
+            summary.rate_limit_rejected
+            or summary.has_status(429)
+            or summary.has_error_code("rate_limit", "rate.limit")
+            or summary.matches_text(_RATE_LIMIT_PATTERNS)
+        ):
+            return FailureDecision(
+                kind=FailureKind.RATE_LIMIT,
+                message=(
+                    "RATE LIMITED detected in output. "
+                    f"Waiting {config.wait_on_limit_mins} minutes before retrying..."
+                ),
+                wait_seconds=config.wait_on_limit_mins * 60,
+                reset_error_count=True,
+                skip_pause=True,
+                should_failover=True,
+            )
+
+        if (
+            summary.has_status(500, 502, 503, 504, 529)
+            or summary.has_error_code("server_error")
+            or summary.matches_text(_OVERLOAD_PATTERNS)
+        ):
+            return FailureDecision(
+                kind=FailureKind.OVERLOADED,
+                message="Codex service overload detected. Waiting 2 minutes before retrying...",
+                wait_seconds=120,
+                skip_pause=True,
+            )
+
+        if exit_code == 2:
+            return FailureDecision(
+                kind=FailureKind.INVALID_REQUEST,
+                fatal=True,
+                should_failover=True,
+                message=(
+                    "FATAL: Codex CLI usage/configuration error (exit code 2). "
+                    f"Check {log_path} for details."
+                ),
+            )
+
+        if (
+            summary.has_status(400)
+            or summary.has_error_code("invalid_request_error")
+            or summary.matches_text(_INVALID_REQUEST_PATTERNS)
+        ):
+            return FailureDecision(
+                kind=FailureKind.INVALID_REQUEST,
+                fatal=True,
+                should_failover=True,
+                message=(
+                    "FATAL: Codex rejected the request. Check the selected model and provider "
+                    f"options. See {log_path} for details."
+                ),
+            )
+
         log_text = read_log_text(log_path, lower=True)
 
         if any(pattern in log_text for pattern in _AUTH_PATTERNS):
@@ -105,17 +175,6 @@ class CodexProvider:
                 message="Codex service overload detected. Waiting 2 minutes before retrying...",
                 wait_seconds=120,
                 skip_pause=True,
-            )
-
-        if exit_code == 2:
-            return FailureDecision(
-                kind=FailureKind.INVALID_REQUEST,
-                fatal=True,
-                should_failover=True,
-                message=(
-                    "FATAL: Codex CLI usage/configuration error (exit code 2). "
-                    f"Check {log_path} for details."
-                ),
             )
 
         if any(pattern in log_text for pattern in _INVALID_REQUEST_PATTERNS):
@@ -151,6 +210,8 @@ _AUTH_PATTERNS = (
 
 _RATE_LIMIT_PATTERNS = (
     "status\\\":429",
+    "usage limit",
+    "hit your limit",
     "rate limit",
     "rate_limit",
     "too many requests",
