@@ -16,7 +16,7 @@ from batonloop.config import (
     ProviderProfile,
     RunnerConfig,
 )
-from batonloop.handoff import metadata_path_for, prompt_artifact_path_for
+from batonloop.handoff import extract_handoff_summary, metadata_path_for, prompt_artifact_path_for
 from batonloop.providers.base import FailureDecision, FailureKind
 from batonloop.runner import run_loop
 
@@ -138,6 +138,11 @@ class RunnerTests(unittest.TestCase):
                         "exit_code": 1,
                         "timed_out": False,
                         "failure_message": "RATE LIMITED detected in output.",
+                        "handoff_summary": (
+                            "Previous iteration summary:\n"
+                            "- Goal: Resume the interrupted task.\n"
+                            "- Interruption: RATE LIMITED."
+                        ),
                     }
                 ),
                 encoding="utf-8",
@@ -162,10 +167,181 @@ class RunnerTests(unittest.TestCase):
             self.assertIn(f"Previous raw log: {latest_log}", log_text)
             self.assertIn("Previous provider: claude", log_text)
             self.assertIn("Previous exit code: 1", log_text)
+            self.assertIn("Previous iteration summary:", log_text)
+            self.assertIn("Goal: Resume the interrupted task.", log_text)
             self.assertIn(
                 "Operator note: Switch providers and continue from the partial work.",
                 log_text,
             )
+
+    def test_extract_handoff_summary_from_claude_log(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000001.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": (
+                                                "Now I have the picture. Phase 4.3 is the next "
+                                                "recommended task - wire weapon `Atk` / `Dmg` via "
+                                                "the `target-pick` tool to `encounterCombat.attemptAttack`."
+                                            ),
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Lint, typecheck, and test all pass. Now update the roadmap and agent notes.",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "system",
+                                "subtype": "task_started",
+                                "description": "Critical review of Phase 4.3a",
+                                "prompt": (
+                                    "You are an independent code reviewer. Give a critical review "
+                                    "of commit `5fed429` on the current branch. Focus areas: "
+                                    "correctness of the new hook and drawer wiring."
+                                ),
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "You've hit your limit - resets 7am.",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="claude")
+
+            assert summary is not None
+            self.assertIn("Previous iteration summary:", summary)
+            self.assertIn("Goal: Now I have the picture. Phase 4.3 is the next recommended task", summary)
+            self.assertIn("Progress checkpoint: Lint, typecheck, and test all pass.", summary)
+            self.assertIn("In-flight task: Critical review of Phase 4.3a:", summary)
+            self.assertIn("Interruption: You've hit your limit - resets 7am.", summary)
+            self.assertLessEqual(len(summary.split()), 120)
+
+    def test_extract_handoff_summary_from_codex_log(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000002.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "Reading prompt from stdin...",
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {
+                                    "type": "agent_message",
+                                    "text": (
+                                        "I have enough context to work the actual 5.0 slice. "
+                                        "The plan is: add `areaOfEffect` to the shared spell "
+                                        "contract and Prisma model, seed it from a curated "
+                                        "override map, add coverage, then update notes."
+                                    ),
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {
+                                    "type": "agent_message",
+                                    "text": (
+                                        "Lint and typecheck are clean. I am making one attempt "
+                                        "at the repo's normal test path as the last gate."
+                                    ),
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "item.updated",
+                                "item": {
+                                    "type": "todo_list",
+                                    "items": [
+                                        {"text": "Implement schema and seed changes", "completed": True},
+                                        {"text": "Add targeted tests", "completed": True},
+                                        {
+                                            "text": "Run verification, update notes, review, and commit",
+                                            "completed": False,
+                                        },
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "item.started",
+                                "item": {
+                                    "type": "collab_tool_call",
+                                    "tool": "spawn_agent",
+                                    "prompt": (
+                                        "Review the current uncommitted diff critically. Focus on "
+                                        "bugs, behavioral regressions, schema mismatches, and "
+                                        "whether the updated roadmap notes match what landed."
+                                    ),
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "turn.failed",
+                                "error": {
+                                    "message": "You've hit your usage limit. Try again later."
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="codex")
+
+            assert summary is not None
+            self.assertIn("Previous iteration summary:", summary)
+            self.assertIn("Goal: I have enough context to work the actual 5.0 slice.", summary)
+            self.assertIn("Progress checkpoint: Lint and typecheck are clean.", summary)
+            self.assertIn(
+                "Checklist: 2/3 complete; remaining: Run verification, update notes, review, and commit",
+                summary,
+            )
+            self.assertIn("In-flight task: spawn_agent: Review the current uncommitted diff critically.", summary)
+            self.assertIn("Interruption: You've hit your usage limit. Try again later.", summary)
+            self.assertLessEqual(len(summary.split()), 140)
 
     def test_failure_iteration_writes_metadata_for_future_resume(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -189,6 +365,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(metadata["failure_message"], "process failed with exit code 1")
             self.assertEqual(metadata["resume_source_log_path"], None)
             self.assertEqual(metadata["failover_target_provider"], None)
+            self.assertEqual(metadata["handoff_summary"], None)
             self.assertIn("git_status", metadata)
 
     def test_rate_limit_failure_automatically_fails_over_to_next_provider(self) -> None:
@@ -228,6 +405,7 @@ class RunnerTests(unittest.TestCase):
             )
             self.assertIn("Current provider: backup", second_log_text)
             self.assertIn("Previous provider: limited", second_log_text)
+            self.assertIn("Previous iteration summary:", second_log_text)
 
 
 class StaticCommandProvider:

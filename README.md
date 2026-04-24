@@ -13,6 +13,7 @@ This is a Python rewrite of the old `ralph.sh` loop runner. The first version ke
 - Automatic in-process failover across multiple providers on eligible failures such as rate limits
 - Provider-specific settings loaded from `batonloop-providers.toml`
 - Resume handoff support so a new run can pick up from a prior iteration log, including cross-provider handoff
+- Resume handoff summaries extracted from prior Claude/Codex logs so the next provider gets a compact state snapshot instead of raw log noise
 - Per-iteration metadata artifacts for future resume/failover runs
 - Small stdlib test suite
 
@@ -66,7 +67,7 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 - Repeat `--provider` to define failover order. BatonLoop keeps using the current provider until it hits an eligible failover condition or you stop the loop.
 - `--check` commands are run with the current shell and stop the loop when all configured checks pass.
 - `--stop-on-clean-git` ignores the configured log directory so BatonLoop's own log files do not keep the repo dirty.
-- `--resume-from` accepts either an `iteration-*.json` log or a BatonLoop log directory. BatonLoop resolves that to a prior iteration, writes per-iteration `.meta.json` artifacts, and appends a generated handoff block to each resumed prompt.
+- `--resume-from` accepts either an `iteration-*.json` log or a BatonLoop log directory. BatonLoop resolves that to a prior iteration, writes per-iteration `.meta.json` artifacts, extracts a compact summary from the prior log when possible, and appends a generated handoff block to each resumed prompt.
 - Auto-failover reuses the same handoff mechanism internally: the failed iteration becomes the resume source for the next provider in the configured order.
 - The core loop no longer depends on `jq`, `bc`, or `setsid`.
 - Adding another provider should mostly be a matter of implementing another adapter in `batonloop/providers/`.
