@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from .config import (
     OutputFormat,
@@ -9,7 +11,9 @@ from .config import (
     parse_non_negative_decimal,
     parse_non_negative_int,
     parse_positive_int,
+    resolve_path,
 )
+from .handoff import resolve_resume_context
 from .providers import ClaudeProvider, CodexProvider
 from .runner import run_loop
 
@@ -191,7 +195,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_handoff_summary_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="batonloop handoff-summary",
+        description="Print the extracted resume handoff summary for an iteration log.",
+    )
+    parser.add_argument(
+        "resume_source",
+        help=(
+            "Iteration log, iteration artifact, or BatonLoop log directory to summarize."
+        ),
+    )
+    return parser
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = tuple(sys.argv[1:] if argv is None else argv)
+
+    if argv and argv[0] == "handoff-summary":
+        parser = build_handoff_summary_parser()
+        args = parser.parse_args(argv[1:])
+        try:
+            resume_context = resolve_resume_context(
+                resolve_path(Path(args.resume_source).expanduser(), Path.cwd())
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            parser.exit(status=1, message=f"ERROR: {exc}\n")
+
+        print(resume_context.previous_handoff_summary or "<no summary>")
+        return 0
+
     parser = build_parser()
     args = parser.parse_args(argv)
 

@@ -27,6 +27,7 @@ python3 -m batonloop --provider claude --provider codex -f ./PROMPT.md
 python3 -m batonloop --provider codex -f ./PROMPT.md --iteration-timeout 20 --check "pytest -q"
 python3 -m batonloop -f ./PROMPT.md --stop-on-regex "DONE" --stop-when-file ./DONE.flag
 python3 -m batonloop --provider codex -f ./PROMPT.md --resume-from ./batonloop-logs --resume-note "Claude hit a usage limit; continue from the in-progress work."
+python3 -m batonloop handoff-summary ./batonloop-logs/iteration-000014.json
 ```
 
 You can also install the local package and use the console script:
@@ -68,6 +69,7 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 - `--check` commands are run with the current shell and stop the loop when all configured checks pass.
 - `--stop-on-clean-git` ignores the configured log directory so BatonLoop's own log files do not keep the repo dirty.
 - `--resume-from` accepts either an `iteration-*.json` log or a BatonLoop log directory. BatonLoop resolves that to a prior iteration, writes per-iteration `.meta.json` artifacts, extracts a compact summary from the prior log when possible, and appends a generated handoff block to each resumed prompt.
+- `batonloop handoff-summary <path>` prints that extracted summary directly for a log, iteration artifact, or BatonLoop log directory.
 - Auto-failover reuses the same handoff mechanism internally: the failed iteration becomes the resume source for the next provider in the configured order.
 - The core loop no longer depends on `jq`, `bc`, or `setsid`.
 - Adding another provider should mostly be a matter of implementing another adapter in `batonloop/providers/`.
