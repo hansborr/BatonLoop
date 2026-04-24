@@ -46,6 +46,8 @@ class CodexProvider:
         if execution.model:
             command.extend(["-m", execution.model])
 
+        command.extend(execution.extra_args)
+
         return command
 
     def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:

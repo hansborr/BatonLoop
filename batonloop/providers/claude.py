@@ -52,6 +52,8 @@ class ClaudeProvider:
         if execution.max_turns is not None:
             command.extend(["--max-turns", str(execution.max_turns)])
 
+        command.extend(execution.extra_args)
+
         return command
 
     def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:

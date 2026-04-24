@@ -37,6 +37,7 @@ class PromptSpecTests(unittest.TestCase):
                         "[providers.codex]",
                         'model = "gpt-5.4"',
                         "safe = true",
+                        'args = ["--profile", "baton", "--sandbox", "workspace-write"]',
                     ]
                 ),
                 encoding="utf-8",
@@ -91,6 +92,59 @@ class PromptSpecTests(unittest.TestCase):
             self.assertEqual(resolve_provider_execution(config, "claude").model, "opus")
             self.assertEqual(resolve_provider_execution(config, "codex").model, "gpt-5.4")
             self.assertTrue(resolve_provider_execution(config, "codex").safe_mode)
+            self.assertEqual(
+                resolve_provider_execution(config, "codex").extra_args,
+                ("--profile", "baton", "--sandbox", "workspace-write"),
+            )
+
+    def test_build_config_rejects_non_string_provider_args(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            prompt_path = temp_root / "PROMPT.md"
+            provider_config_path = temp_root / "batonloop-providers.toml"
+            prompt_path.write_text("develop", encoding="utf-8")
+            provider_config_path.write_text(
+                "\n".join(
+                    [
+                        "[providers.codex]",
+                        'args = ["--profile", 7]',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, r"\.args must be an array of strings"):
+                build_config(
+                    Namespace(
+                        provider_names=["codex"],
+                        provider_config=str(provider_config_path),
+                        provider_binary=None,
+                        prompt_specs=[str(prompt_path)],
+                        max_iterations=0,
+                        max_cost=Decimal("0"),
+                        max_duration_hours=Decimal("0"),
+                        iteration_timeout_minutes=Decimal("0"),
+                        pause_seconds=5,
+                        model=None,
+                        wait_on_limit_mins=30,
+                        max_consecutive_errors=5,
+                        max_turns=None,
+                        log_dir=str(temp_root / "logs"),
+                        log_retain=0,
+                        check_commands=[],
+                        stop_on_regexes=[],
+                        stop_on_clean_git=False,
+                        stop_when_files=[],
+                        output_format=OutputFormat.STREAM_JSON.value,
+                        no_stream=False,
+                        live_output=False,
+                        bare=None,
+                        safe=None,
+                        resume_from=None,
+                        resume_note=None,
+                        dry_run=False,
+                    )
+                )
 
 
 if __name__ == "__main__":

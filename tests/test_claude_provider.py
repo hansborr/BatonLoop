@@ -42,6 +42,33 @@ class ClaudeProviderTests(unittest.TestCase):
             ],
         )
 
+    def test_build_command_appends_extra_provider_args(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            config = _make_config(
+                Path(tmp_dir),
+                extra_args=("--custom-flag", "custom-value"),
+            )
+            execution = resolve_provider_execution(config, "claude")
+            command = self.provider.build_command(config, execution)
+
+        self.assertEqual(
+            command,
+            [
+                "claude",
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--dangerously-skip-permissions",
+                "--model",
+                "sonnet",
+                "--max-turns",
+                "7",
+                "--custom-flag",
+                "custom-value",
+            ],
+        )
+
     def test_extract_cost_from_stream_json_log(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             log_path = Path(tmp_dir) / "iteration-000001.json"
@@ -185,13 +212,20 @@ def _make_config(
     temp_root: Path,
     *,
     output_format: OutputFormat = OutputFormat.STREAM_JSON,
+    extra_args: tuple[str, ...] = (),
 ) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
         working_dir=temp_root,
         provider_names=("claude",),
-        provider_profiles={"claude": ProviderProfile(model="sonnet", max_turns=7)},
+        provider_profiles={
+            "claude": ProviderProfile(
+                model="sonnet",
+                max_turns=7,
+                extra_args=extra_args,
+            )
+        },
         provider_config_path=None,
         default_provider_profile=ProviderProfile(),
         prompt_specs=(PromptSpec(path=prompt_path, repeat=1),),

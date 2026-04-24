@@ -28,6 +28,7 @@ class ProviderProfile:
     max_turns: int | None = None
     use_bare: bool | None = None
     safe_mode: bool | None = None
+    extra_args: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,7 @@ class ProviderExecution:
     max_turns: int | None
     use_bare: bool
     safe_mode: bool
+    extra_args: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +157,7 @@ def resolve_provider_execution(config: RunnerConfig, provider_name: str) -> Prov
         max_turns=_first_defined(profile.max_turns, defaults.max_turns),
         use_bare=_first_defined(profile.use_bare, defaults.use_bare, fallback=False),
         safe_mode=_first_defined(profile.safe_mode, defaults.safe_mode, fallback=False),
+        extra_args=defaults.extra_args + profile.extra_args,
     )
 
 
@@ -282,7 +285,7 @@ def _parse_provider_profile(
     raw_profile: dict[str, Any],
     path: Path,
 ) -> ProviderProfile:
-    allowed_keys = {"binary", "model", "max_turns", "bare", "safe"}
+    allowed_keys = {"binary", "model", "max_turns", "bare", "safe", "args"}
     unknown_keys = sorted(set(raw_profile) - allowed_keys)
     if unknown_keys:
         raise ValueError(
@@ -295,6 +298,7 @@ def _parse_provider_profile(
     max_turns = raw_profile.get("max_turns")
     use_bare = raw_profile.get("bare")
     safe_mode = raw_profile.get("safe")
+    extra_args = raw_profile.get("args")
 
     if binary is not None and not isinstance(binary, str):
         raise ValueError(
@@ -317,6 +321,15 @@ def _parse_provider_profile(
         raise ValueError(
             f"Provider config {path} entry [providers.{provider_name}].safe must be a boolean."
         )
+    if extra_args is None:
+        parsed_extra_args: tuple[str, ...] = ()
+    elif not isinstance(extra_args, list) or any(not isinstance(arg, str) for arg in extra_args):
+        raise ValueError(
+            f"Provider config {path} entry [providers.{provider_name}].args must be an "
+            "array of strings."
+        )
+    else:
+        parsed_extra_args = tuple(extra_args)
 
     return ProviderProfile(
         binary=binary,
@@ -324,6 +337,7 @@ def _parse_provider_profile(
         max_turns=max_turns,
         use_bare=use_bare,
         safe_mode=safe_mode,
+        extra_args=parsed_extra_args,
     )
 
 

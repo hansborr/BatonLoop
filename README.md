@@ -49,9 +49,15 @@ safe = true
 [providers.codex]
 model = "gpt-5.4"
 bare = true
+args = [
+  "--profile", "baton",
+  "--sandbox", "workspace-write",
+  "-c", "shell_environment_policy.inherit=all",
+]
 ```
 
 BatonLoop automatically loads that file when it exists. It also falls back to `./ralph-providers.toml` for compatibility. You can point at another file with `--provider-config`.
+The shared keys are `binary`, `model`, `max_turns`, `bare`, and `safe`. Use `args` for provider-owned CLI flags so new adapter options do not require changes to BatonLoop core config.
 
 When you run:
 
@@ -74,4 +80,4 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 - `batonloop handoff-summary <path>` prints that extracted summary directly for a log, iteration artifact, or BatonLoop log directory.
 - Auto-failover reuses the same handoff mechanism internally: the failed iteration becomes the resume source for the next provider in the configured order.
 - The core loop no longer depends on `jq`, `bc`, or `setsid`.
-- Adding another provider should mostly be a matter of implementing another adapter in `batonloop/providers/`.
+- Adding another provider should mostly be a matter of implementing another adapter in `batonloop/providers/`; provider-specific CLI flags can live in profile `args` instead of requiring new core config keys.

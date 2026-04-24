@@ -67,6 +67,34 @@ class CodexProviderTests(unittest.TestCase):
             ],
         )
 
+    def test_build_command_appends_extra_provider_args(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            config = _make_config(
+                Path(tmp_dir),
+                extra_args=("--profile", "baton", "--sandbox", "workspace-write"),
+            )
+            execution = resolve_provider_execution(config, "codex")
+            command = self.provider.build_command(config, execution)
+
+        self.assertEqual(
+            command,
+            [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-C",
+                str(config.working_dir),
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-m",
+                "gpt-5",
+                "--profile",
+                "baton",
+                "--sandbox",
+                "workspace-write",
+            ],
+        )
+
     def test_validate_config_rejects_unsupported_options(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             json_config = _make_config(Path(tmp_dir), output_format=OutputFormat.JSON)
@@ -161,6 +189,7 @@ def _make_config(
     model: str | None = "gpt-5",
     output_format: OutputFormat = OutputFormat.STREAM_JSON,
     max_turns: int | None = None,
+    extra_args: tuple[str, ...] = (),
 ) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
@@ -173,6 +202,7 @@ def _make_config(
                 max_turns=max_turns,
                 use_bare=use_bare,
                 safe_mode=safe_mode,
+                extra_args=extra_args,
             )
         },
         provider_config_path=None,
