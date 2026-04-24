@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from pathlib import Path
 
 from ..config import OutputFormat, RunnerConfig
 from .base import FailureDecision
@@ -28,7 +27,7 @@ class CodexProvider:
             "--json",
             "--skip-git-repo-check",
             "-C",
-            str(Path.cwd()),
+            str(config.working_dir),
         ]
 
         if config.safe_mode:
@@ -68,7 +67,7 @@ class CodexProvider:
         log_path: Path,
         config: RunnerConfig,
     ) -> FailureDecision:
-        log_text = read_log_text(log_path)
+        log_text = read_log_text(log_path, lower=True)
 
         if any(pattern in log_text for pattern in _AUTH_PATTERNS):
             return FailureDecision(
@@ -169,4 +168,3 @@ def _nested_lookup(payload: dict[str, object], *path: str) -> object | None:
             return None
         current = current[segment]
     return current
-

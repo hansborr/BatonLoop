@@ -73,6 +73,7 @@ def _make_config(temp_root: Path) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
+        working_dir=temp_root,
         provider_name="claude",
         provider_binary=None,
         prompt_specs=(PromptSpec(path=prompt_path, repeat=1),),
@@ -80,6 +81,7 @@ def _make_config(temp_root: Path) -> RunnerConfig:
         max_iterations=0,
         max_cost=Decimal("0"),
         max_duration_hours=Decimal("0"),
+        iteration_timeout_minutes=Decimal("0"),
         pause_seconds=5,
         model="sonnet",
         wait_on_limit_mins=30,
@@ -87,6 +89,10 @@ def _make_config(temp_root: Path) -> RunnerConfig:
         max_turns=7,
         log_dir=temp_root / "logs",
         log_retain=0,
+        check_commands=(),
+        stop_on_regexes=(),
+        stop_on_clean_git=False,
+        stop_when_files=(),
         output_format=OutputFormat.STREAM_JSON,
         use_bare=False,
         safe_mode=False,

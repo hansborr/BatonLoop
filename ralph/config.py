@@ -21,6 +21,7 @@ class PromptSpec:
 
 @dataclass(frozen=True, slots=True)
 class RunnerConfig:
+    working_dir: Path
     provider_name: str
     provider_binary: str | None
     prompt_specs: tuple[PromptSpec, ...]
@@ -28,6 +29,7 @@ class RunnerConfig:
     max_iterations: int
     max_cost: Decimal
     max_duration_hours: Decimal
+    iteration_timeout_minutes: Decimal
     pause_seconds: int
     model: str | None
     wait_on_limit_mins: int
@@ -35,6 +37,10 @@ class RunnerConfig:
     max_turns: int | None
     log_dir: Path
     log_retain: int
+    check_commands: tuple[str, ...]
+    stop_on_regexes: tuple[str, ...]
+    stop_on_clean_git: bool
+    stop_when_files: tuple[Path, ...]
     output_format: OutputFormat
     use_bare: bool
     safe_mode: bool
@@ -73,6 +79,20 @@ def ensure_prompt_files_exist(prompt_sequence: tuple[Path, ...]) -> None:
             raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
 
 
+def resolve_path(path: Path, base_dir: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return base_dir / path
+
+
+def ensure_valid_regexes(patterns: tuple[str, ...]) -> None:
+    for pattern in patterns:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"Invalid regular expression {pattern!r}: {exc}") from exc
+
+
 def parse_non_negative_int(raw: str) -> int:
     try:
         value = int(raw)
@@ -101,15 +121,29 @@ def parse_non_negative_decimal(raw: str) -> Decimal:
 
 
 def build_config(args: argparse.Namespace) -> RunnerConfig:
+    working_dir = Path.cwd()
     raw_prompt_specs = args.prompt_specs or ["./PROMPT.md"]
-    prompt_specs = tuple(parse_prompt_spec(raw) for raw in raw_prompt_specs)
+    prompt_specs = tuple(
+        PromptSpec(
+            path=resolve_path(parsed.path, working_dir),
+            repeat=parsed.repeat,
+        )
+        for parsed in (parse_prompt_spec(raw) for raw in raw_prompt_specs)
+    )
     prompt_sequence = expand_prompt_specs(prompt_specs)
+    stop_on_regexes = tuple(args.stop_on_regexes or ())
+    ensure_valid_regexes(stop_on_regexes)
+    stop_when_files = tuple(
+        resolve_path(Path(raw_path).expanduser(), working_dir)
+        for raw_path in (args.stop_when_files or [])
+    )
 
     output_format = (
         OutputFormat.JSON if args.no_stream else OutputFormat(args.output_format)
     )
 
     config = RunnerConfig(
+        working_dir=working_dir,
         provider_name=args.provider,
         provider_binary=args.provider_binary,
         prompt_specs=prompt_specs,
@@ -117,13 +151,18 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         max_iterations=args.max_iterations,
         max_cost=args.max_cost,
         max_duration_hours=args.max_duration_hours,
+        iteration_timeout_minutes=args.iteration_timeout_minutes,
         pause_seconds=args.pause_seconds,
         model=args.model or None,
         wait_on_limit_mins=args.wait_on_limit_mins,
         max_consecutive_errors=args.max_consecutive_errors,
         max_turns=args.max_turns,
-        log_dir=Path(args.log_dir).expanduser(),
+        log_dir=resolve_path(Path(args.log_dir).expanduser(), working_dir),
         log_retain=args.log_retain,
+        check_commands=tuple(args.check_commands or ()),
+        stop_on_regexes=stop_on_regexes,
+        stop_on_clean_git=args.stop_on_clean_git,
+        stop_when_files=stop_when_files,
         output_format=output_format,
         use_bare=args.bare,
         safe_mode=args.safe,
@@ -132,4 +171,3 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
 
     ensure_prompt_files_exist(config.prompt_sequence)
     return config
-

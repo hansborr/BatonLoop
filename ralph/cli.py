@@ -74,6 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pause between iterations in seconds.",
     )
     parser.add_argument(
+        "--iteration-timeout",
+        dest="iteration_timeout_minutes",
+        type=parse_non_negative_decimal,
+        default=parse_non_negative_decimal("0"),
+        help="Timeout in minutes for each provider run and post-iteration check. Use 0 for unlimited.",
+    )
+    parser.add_argument(
         "-m",
         "--model",
         help="Model name to pass to the provider.",
@@ -109,6 +116,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_non_negative_int,
         default=0,
         help="Keep only the last N iteration logs. Use 0 to keep all.",
+    )
+    parser.add_argument(
+        "--check",
+        action="append",
+        dest="check_commands",
+        help="Run a shell command after each successful iteration. Stop when all configured checks pass.",
+    )
+    parser.add_argument(
+        "--stop-on-regex",
+        action="append",
+        dest="stop_on_regexes",
+        help="Stop when the given regular expression matches the current iteration log.",
+    )
+    parser.add_argument(
+        "--stop-on-clean-git",
+        action="store_true",
+        help="Stop when the current Git worktree is clean after a successful iteration.",
+    )
+    parser.add_argument(
+        "--stop-when-file",
+        action="append",
+        dest="stop_when_files",
+        help="Stop when the given file exists after a successful iteration. Can be specified multiple times.",
     )
     parser.add_argument(
         "--output-format",

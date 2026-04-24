@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -13,6 +14,7 @@ from types import FrameType
 
 from .config import RunnerConfig
 from .providers.base import Provider
+from .providers.utils import read_log_text
 
 
 @dataclass(slots=True)
@@ -22,6 +24,12 @@ class RunState:
     completed_iterations: int = 0
     total_cost: Decimal = field(default_factory=lambda: Decimal("0"))
     consecutive_errors: int = 0
+
+
+@dataclass(slots=True)
+class CommandResult:
+    exit_code: int
+    timed_out: bool = False
 
 
 class StopController:
@@ -61,26 +69,25 @@ class StopController:
 
         print()
         self._logger.info("FORCE QUIT - terminating immediately.")
-        self._terminate_current_process()
+        self._force_terminate_current_process()
         raise SystemExit(1)
 
     def _terminate_current_process(self) -> None:
         if self._current_process is None or self._current_process.poll() is not None:
             return
 
-        try:
-            if hasattr(os, "killpg"):
-                os.killpg(self._current_process.pid, signal.SIGTERM)
-            else:
-                self._current_process.terminate()
-        except ProcessLookupError:
+        _terminate_process_tree(self._current_process, force=False)
+
+    def _force_terminate_current_process(self) -> None:
+        if self._current_process is None or self._current_process.poll() is not None:
             return
-        except PermissionError:
-            self._current_process.terminate()
+
+        _terminate_process_tree(self._current_process, force=True)
 
 
 def run_loop(config: RunnerConfig, provider: Provider) -> int:
     provider.validate_config(config)
+    _validate_runtime_config(config)
     _ensure_executable_available(provider.executable_name(config))
     config.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -130,16 +137,38 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
                 )
 
             iteration_log = config.log_dir / f"iteration-{state.iteration:06d}.json"
-            exit_code = _run_iteration(
+            iteration_result = _run_iteration(
                 provider=provider,
                 config=config,
                 prompt_path=current_prompt,
                 log_path=iteration_log,
                 controller=controller,
             )
+            exit_code = iteration_result.exit_code
             logger.info("Exit code: %s", exit_code)
 
-            if exit_code == 0:
+            if iteration_result.timed_out:
+                state.consecutive_errors += 1
+                logger.warning(
+                    "Iteration %s timed out after %s and was terminated.",
+                    state.iteration,
+                    _format_minutes_limit(config.iteration_timeout_minutes),
+                )
+
+                if state.consecutive_errors >= config.max_consecutive_errors:
+                    logger.error(
+                        "FATAL: %s consecutive errors. Stopping.",
+                        config.max_consecutive_errors,
+                    )
+                    exit_status = 1
+                    break
+
+                logger.info(
+                    "Consecutive errors: %s/%s. Retrying after pause...",
+                    state.consecutive_errors,
+                    config.max_consecutive_errors,
+                )
+            elif exit_code == 0:
                 state.consecutive_errors = 0
                 state.completed_iterations += 1
                 logger.info("Iteration %s completed successfully.", state.iteration)
@@ -153,7 +182,18 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
                         _format_decimal(state.total_cost),
                     )
 
+                stop_reason = _evaluate_post_iteration_stop(
+                    logger=logger,
+                    config=config,
+                    controller=controller,
+                    iteration=state.iteration,
+                    iteration_log=iteration_log,
+                )
                 _rotate_logs(config.log_dir, config.log_retain)
+
+                if stop_reason:
+                    logger.info(stop_reason)
+                    break
 
                 if config.max_cost and state.total_cost >= config.max_cost:
                     logger.info(
@@ -243,10 +283,28 @@ def _ensure_executable_available(command: str) -> None:
         raise FileNotFoundError(f"'{command}' command not found in PATH.")
 
 
+def _validate_runtime_config(config: RunnerConfig) -> None:
+    if not config.working_dir.is_dir():
+        raise FileNotFoundError(f"Working directory does not exist: {config.working_dir}")
+
+    if config.stop_on_clean_git:
+        _ensure_executable_available("git")
+        git_probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=config.working_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if git_probe.returncode != 0 or git_probe.stdout.strip() != "true":
+            raise ValueError("--stop-on-clean-git requires running inside a Git worktree.")
+
+
 def _log_startup(logger: logging.Logger, config: RunnerConfig, provider: Provider) -> None:
     logger.info("=== Ralph Loop Starting ===")
     logger.info("Provider:        %s", provider.name)
     logger.info("Executable:      %s", provider.executable_name(config))
+    logger.info("Working dir:     %s", config.working_dir)
 
     if len(config.prompt_sequence) == 1:
         logger.info("Prompt file:     %s", config.prompt_sequence[0])
@@ -258,6 +316,7 @@ def _log_startup(logger: logging.Logger, config: RunnerConfig, provider: Provide
     logger.info("Max iterations:  %s", _format_limit(config.max_iterations))
     logger.info("Max cost:        %s", _format_money_limit(config.max_cost))
     logger.info("Max duration:    %s", _format_duration_limit(config.max_duration_hours))
+    logger.info("Iter timeout:    %s", _format_minutes_limit(config.iteration_timeout_minutes))
     logger.info("Pause between:   %ss", config.pause_seconds)
     logger.info("Model:           %s", config.model or "default")
     logger.info("Rate limit wait: %sm", config.wait_on_limit_mins)
@@ -268,6 +327,25 @@ def _log_startup(logger: logging.Logger, config: RunnerConfig, provider: Provide
     logger.info("Safe mode:       %s", config.safe_mode)
     logger.info("Log directory:   %s", config.log_dir)
     logger.info("Log retain:      %s", _format_limit(config.log_retain))
+    logger.info(
+        "Checks:          %s",
+        f"{len(config.check_commands)} command(s)" if config.check_commands else "none",
+    )
+    for index, command in enumerate(config.check_commands, start=1):
+        logger.info("  [check %s/%s] %s", index, len(config.check_commands), command)
+    logger.info(
+        "Stop regexes:    %s",
+        f"{len(config.stop_on_regexes)} pattern(s)" if config.stop_on_regexes else "none",
+    )
+    for index, pattern in enumerate(config.stop_on_regexes, start=1):
+        logger.info("  [regex %s/%s] %s", index, len(config.stop_on_regexes), pattern)
+    logger.info("Stop clean git:  %s", config.stop_on_clean_git)
+    logger.info(
+        "Stop files:      %s",
+        f"{len(config.stop_when_files)} path(s)" if config.stop_when_files else "none",
+    )
+    for index, path in enumerate(config.stop_when_files, start=1):
+        logger.info("  [file %s/%s] %s", index, len(config.stop_when_files), path)
     logger.info("===========================")
 
 
@@ -308,25 +386,16 @@ def _run_iteration(
     prompt_path: Path,
     log_path: Path,
     controller: StopController,
-) -> int:
+) -> CommandResult:
     command = provider.build_command(config)
-    with prompt_path.open("rb") as prompt_handle, log_path.open("wb") as log_handle:
-        process = subprocess.Popen(
-            command,
-            stdin=prompt_handle,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        controller.attach_process(process)
-        try:
-            while True:
-                try:
-                    return process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    continue
-        finally:
-            controller.detach_process()
+    return _run_subprocess(
+        command=command,
+        cwd=config.working_dir,
+        controller=controller,
+        log_path=log_path,
+        stdin_path=prompt_path,
+        timeout_seconds=_timeout_seconds(config),
+    )
 
 
 def _interruptible_sleep(seconds: int, controller: StopController) -> None:
@@ -347,16 +416,263 @@ def _rotate_logs(log_dir: Path, retain: int) -> None:
     if retain == 0:
         return
 
-    files = sorted(
-        log_dir.glob("iteration-*.json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for path in files[retain:]:
-        try:
-            path.unlink()
-        except FileNotFoundError:
+    grouped_files: dict[int, list[Path]] = {}
+    for path in log_dir.iterdir():
+        match = _ITERATION_ARTIFACT_PATTERN.match(path.name)
+        if match is None:
             continue
+        iteration_number = int(match.group(1))
+        grouped_files.setdefault(iteration_number, []).append(path)
+
+    iteration_numbers = sorted(grouped_files, reverse=True)
+    for iteration_number in iteration_numbers[retain:]:
+        for path in grouped_files[iteration_number]:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+
+
+def _evaluate_post_iteration_stop(
+    *,
+    logger: logging.Logger,
+    config: RunnerConfig,
+    controller: StopController,
+    iteration: int,
+    iteration_log: Path,
+) -> str | None:
+    regex_match = _match_stop_regex(iteration_log, config.stop_on_regexes)
+    if regex_match is not None:
+        return f"STOP: Stop regex matched iteration output: {regex_match!r}"
+
+    stop_file = _find_stop_file(config.stop_when_files)
+    if stop_file is not None:
+        return f"STOP: Stop file detected: {stop_file}"
+
+    if config.stop_on_clean_git and _git_worktree_is_clean(config):
+        return "STOP: Git worktree is clean."
+
+    if config.check_commands and _run_post_iteration_checks(
+        logger=logger,
+        config=config,
+        controller=controller,
+        iteration=iteration,
+    ):
+        return "STOP: All post-iteration checks passed."
+
+    return None
+
+
+def _run_post_iteration_checks(
+    *,
+    logger: logging.Logger,
+    config: RunnerConfig,
+    controller: StopController,
+    iteration: int,
+) -> bool:
+    all_checks_passed = True
+    for index, command in enumerate(config.check_commands, start=1):
+        check_log = config.log_dir / f"iteration-{iteration:06d}-check-{index:02d}.log"
+        logger.info("Running check [%s/%s]: %s", index, len(config.check_commands), command)
+        result = _run_subprocess(
+            command=command,
+            cwd=config.working_dir,
+            controller=controller,
+            log_path=check_log,
+            shell=True,
+            timeout_seconds=_timeout_seconds(config),
+        )
+
+        if result.timed_out:
+            all_checks_passed = False
+            logger.warning(
+                "Check [%s/%s] timed out after %s. Log: %s",
+                index,
+                len(config.check_commands),
+                _format_minutes_limit(config.iteration_timeout_minutes),
+                check_log,
+            )
+            continue
+
+        if result.exit_code == 0:
+            logger.info(
+                "Check [%s/%s] passed. Log: %s",
+                index,
+                len(config.check_commands),
+                check_log,
+            )
+            continue
+
+        all_checks_passed = False
+        logger.warning(
+            "Check [%s/%s] failed with exit code %s. Log: %s",
+            index,
+            len(config.check_commands),
+            result.exit_code,
+            check_log,
+        )
+
+    return all_checks_passed
+
+
+def _run_subprocess(
+    *,
+    command: list[str] | str,
+    cwd: Path,
+    controller: StopController,
+    log_path: Path,
+    stdin_path: Path | None = None,
+    shell: bool = False,
+    timeout_seconds: float | None = None,
+) -> CommandResult:
+    popen_kwargs: dict[str, object] = {
+        "stdout": None,
+        "stderr": subprocess.STDOUT,
+        "start_new_session": True,
+        "cwd": cwd,
+        "shell": shell,
+    }
+    if shell:
+        popen_kwargs["executable"] = os.environ.get("SHELL") or "/bin/sh"
+
+    stdin_handle = None
+    try:
+        if stdin_path is not None:
+            stdin_handle = stdin_path.open("rb")
+            popen_kwargs["stdin"] = stdin_handle
+
+        with log_path.open("wb") as log_handle:
+            popen_kwargs["stdout"] = log_handle
+            process = subprocess.Popen(command, **popen_kwargs)
+            controller.attach_process(process)
+            try:
+                started_at = time.monotonic()
+                while True:
+                    wait_timeout = 1.0
+                    if timeout_seconds is not None:
+                        remaining = timeout_seconds - (time.monotonic() - started_at)
+                        if remaining <= 0:
+                            _terminate_process_tree(process, force=False)
+                            return CommandResult(exit_code=process.wait(), timed_out=True)
+                        wait_timeout = min(wait_timeout, remaining)
+
+                    try:
+                        return CommandResult(exit_code=process.wait(timeout=wait_timeout))
+                    except subprocess.TimeoutExpired:
+                        continue
+            finally:
+                controller.detach_process()
+    finally:
+        if stdin_handle is not None:
+            stdin_handle.close()
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    force: bool,
+    kill_after_seconds: float = 5.0,
+) -> None:
+    if process.poll() is not None:
+        return
+
+    _signal_process_tree(process, signal.SIGKILL if force else signal.SIGTERM)
+
+    if force:
+        return
+
+    deadline = time.monotonic() + kill_after_seconds
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+    if process.poll() is None:
+        _signal_process_tree(process, signal.SIGKILL)
+
+
+def _signal_process_tree(process: subprocess.Popen[bytes], signum: signal.Signals) -> None:
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(process.pid, signum)
+        else:
+            process.send_signal(signum)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        if signum is signal.SIGKILL:
+            process.kill()
+        elif signum is signal.SIGTERM:
+            process.terminate()
+        else:
+            process.send_signal(signum)
+
+
+def _timeout_seconds(config: RunnerConfig) -> float | None:
+    if config.iteration_timeout_minutes == 0:
+        return None
+    return float(config.iteration_timeout_minutes * Decimal("60"))
+
+
+def _match_stop_regex(log_path: Path, patterns: tuple[str, ...]) -> str | None:
+    if not patterns:
+        return None
+
+    log_text = read_log_text(log_path)
+    for pattern in patterns:
+        if re.search(pattern, log_text, re.MULTILINE):
+            return pattern
+    return None
+
+
+def _find_stop_file(paths: tuple[Path, ...]) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def _git_worktree_is_clean(config: RunnerConfig) -> bool:
+    repo_root = _git_toplevel(config.working_dir)
+    status_command = [
+        "git",
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignored=no",
+        "--",
+        ".",
+    ]
+
+    try:
+        relative_log_dir = config.log_dir.relative_to(repo_root)
+    except ValueError:
+        relative_log_dir = None
+
+    if relative_log_dir is not None:
+        status_command.append(f":(exclude){relative_log_dir.as_posix()}")
+
+    status_result = subprocess.run(
+        status_command,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status_result.returncode != 0:
+        raise RuntimeError(f"Unable to determine Git status for {repo_root}.")
+    return status_result.stdout.strip() == ""
+
+
+def _git_toplevel(working_dir: Path) -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=working_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("--stop-on-clean-git requires running inside a Git worktree.")
+    return Path(result.stdout.strip())
 
 
 def _format_decimal(value: Decimal) -> str:
@@ -376,3 +692,10 @@ def _format_money_limit(value: Decimal) -> str:
 
 def _format_duration_limit(value: Decimal) -> str:
     return "unlimited" if value == 0 else f"{_format_decimal(value)}h"
+
+
+def _format_minutes_limit(value: Decimal) -> str:
+    return "unlimited" if value == 0 else f"{_format_decimal(value)}m"
+
+
+_ITERATION_ARTIFACT_PATTERN = re.compile(r"^iteration-(\d{6})(?:$|[.-])")

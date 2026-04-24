@@ -77,7 +77,7 @@ class ClaudeProvider:
                 ),
             )
 
-        log_text = read_log_text(log_path)
+        log_text = read_log_text(log_path, lower=True)
 
         if exit_code == 1:
             if any(pattern in log_text for pattern in ("rate.limit", "usage.limit", "rate_limit")):

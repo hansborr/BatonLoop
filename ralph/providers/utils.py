@@ -6,11 +6,14 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-def read_log_text(log_path: Path) -> str:
+def read_log_text(log_path: Path, *, lower: bool = False) -> str:
     try:
-        return log_path.read_text(encoding="utf-8", errors="ignore").lower()
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return ""
+    if lower:
+        return text.lower()
+    return text
 
 
 def decimal_from_value(value: object) -> Decimal:
@@ -38,4 +41,3 @@ def iter_jsonl(log_path: Path) -> Iterator[dict[str, Any]]:
                     yield payload
     except OSError:
         return
-

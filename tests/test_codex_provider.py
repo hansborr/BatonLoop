@@ -16,7 +16,8 @@ class CodexProviderTests(unittest.TestCase):
 
     def test_build_command_uses_bypass_mode_by_default(self) -> None:
         with TemporaryDirectory() as tmp_dir:
-            command = self.provider.build_command(_make_config(Path(tmp_dir)))
+            config = _make_config(Path(tmp_dir))
+            command = self.provider.build_command(config)
 
         self.assertEqual(
             command,
@@ -26,7 +27,7 @@ class CodexProviderTests(unittest.TestCase):
                 "--json",
                 "--skip-git-repo-check",
                 "-C",
-                str(Path.cwd()),
+                str(config.working_dir),
                 "--dangerously-bypass-approvals-and-sandbox",
                 "-m",
                 "gpt-5",
@@ -51,7 +52,7 @@ class CodexProviderTests(unittest.TestCase):
                 "--json",
                 "--skip-git-repo-check",
                 "-C",
-                str(Path.cwd()),
+                str(config.working_dir),
                 "--full-auto",
                 "--ignore-user-config",
                 "--ignore-rules",
@@ -115,6 +116,7 @@ def _make_config(
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
+        working_dir=temp_root,
         provider_name="codex",
         provider_binary=None,
         prompt_specs=(PromptSpec(path=prompt_path, repeat=1),),
@@ -122,6 +124,7 @@ def _make_config(
         max_iterations=0,
         max_cost=Decimal("0"),
         max_duration_hours=Decimal("0"),
+        iteration_timeout_minutes=Decimal("0"),
         pause_seconds=5,
         model=model,
         wait_on_limit_mins=30,
@@ -129,11 +132,16 @@ def _make_config(
         max_turns=max_turns,
         log_dir=temp_root / "logs",
         log_retain=0,
+        check_commands=(),
+        stop_on_regexes=(),
+        stop_on_clean_git=False,
+        stop_when_files=(),
         output_format=output_format,
         use_bare=use_bare,
         safe_mode=safe_mode,
         dry_run=False,
     )
+
 
 
 if __name__ == "__main__":

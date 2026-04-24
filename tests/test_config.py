@@ -36,6 +36,7 @@ class PromptSpecTests(unittest.TestCase):
                     max_iterations=0,
                     max_cost=Decimal("0"),
                     max_duration_hours=Decimal("0"),
+                    iteration_timeout_minutes=Decimal("0"),
                     pause_seconds=5,
                     model=None,
                     wait_on_limit_mins=30,
@@ -43,6 +44,10 @@ class PromptSpecTests(unittest.TestCase):
                     max_turns=None,
                     log_dir=str(temp_root / "logs"),
                     log_retain=0,
+                    check_commands=["pytest -q"],
+                    stop_on_regexes=["DONE"],
+                    stop_on_clean_git=False,
+                    stop_when_files=[str(temp_root / "done.flag")],
                     output_format=OutputFormat.STREAM_JSON.value,
                     no_stream=False,
                     bare=False,
@@ -56,8 +61,11 @@ class PromptSpecTests(unittest.TestCase):
                 (prompt_path, prompt_path, review_path),
             )
             self.assertEqual(config.output_format, OutputFormat.STREAM_JSON)
+            self.assertEqual(config.iteration_timeout_minutes, Decimal("0"))
+            self.assertEqual(config.check_commands, ("pytest -q",))
+            self.assertEqual(config.stop_on_regexes, ("DONE",))
+            self.assertEqual(config.stop_when_files, (temp_root / "done.flag",))
 
 
 if __name__ == "__main__":
     unittest.main()
-
