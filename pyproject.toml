@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ralph-loop"
+version = "0.1.0"
+description = "Run AI coding agents in a controllable loop."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "OpenAI Codex" }
+]
+
+[project.scripts]
+ralph = "ralph.cli:main"
+
+[tool.setuptools]
+packages = ["ralph", "ralph.providers"]
+
