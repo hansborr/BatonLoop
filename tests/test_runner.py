@@ -8,6 +8,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from batonloop.config import (
     OutputFormat,
@@ -439,6 +440,44 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("In-flight task: spawn_agent: Review the current uncommitted diff critically.", summary)
             self.assertIn("Interruption: You've hit your usage limit. Try again later.", summary)
             self.assertLessEqual(len(summary.split()), 140)
+
+    def test_extract_handoff_summary_streams_jsonl_logs(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000003.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Phase 5.1 is the next recommended task.",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "turn.failed",
+                                "error": {"message": "You've hit your usage limit."},
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("pathlib.Path.read_text", side_effect=AssertionError("unexpected read_text")):
+                summary = extract_handoff_summary(log_path, provider_hint="claude")
+
+            assert summary is not None
+            self.assertIn("Goal: Phase 5.1 is the next recommended task.", summary)
+            self.assertIn("Interruption: You've hit your usage limit.", summary)
 
     def test_failure_iteration_writes_metadata_for_future_resume(self) -> None:
         with TemporaryDirectory() as tmp_dir:

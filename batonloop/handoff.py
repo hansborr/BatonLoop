@@ -232,45 +232,58 @@ def extract_handoff_summary(
     interruption_message: str | None = None
 
     try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        with log_path.open(encoding="utf-8", errors="replace") as handle:
+            pending_payloads: tuple[dict[str, object], ...] | None = None
+
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                if pending_payloads is not None:
+                    todo_snapshot, interruption_message = _consume_summary_payloads(
+                        pending_payloads,
+                        messages=messages,
+                        fallback_user_messages=fallback_user_messages,
+                        tasks=tasks,
+                        todo_snapshot=todo_snapshot,
+                        interruption_message=interruption_message,
+                    )
+                    pending_payloads = None
+
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    if line[:1] in {"{", "["}:
+                        whole_payloads = _load_whole_log_payloads(raw_line + handle.read())
+                        if whole_payloads is not None:
+                            todo_snapshot, interruption_message = _consume_summary_payloads(
+                                whole_payloads,
+                                messages=messages,
+                                fallback_user_messages=fallback_user_messages,
+                                tasks=tasks,
+                                todo_snapshot=todo_snapshot,
+                                interruption_message=interruption_message,
+                            )
+                            break
+                    if interruption_message is None and _is_interruption_text(line):
+                        interruption_message = _clean_text(line)
+                    continue
+
+                pending_payloads = _coerce_summary_payloads(payload)
+                continue
+
+            if pending_payloads is not None:
+                todo_snapshot, interruption_message = _consume_summary_payloads(
+                    pending_payloads,
+                    messages=messages,
+                    fallback_user_messages=fallback_user_messages,
+                    tasks=tasks,
+                    todo_snapshot=todo_snapshot,
+                    interruption_message=interruption_message,
+                )
     except OSError:
         return None
-
-    whole_payloads = _load_whole_log_payloads(log_text)
-    if whole_payloads is not None:
-        for payload in whole_payloads:
-            todo_snapshot, interruption_message = _consume_summary_payload(
-                payload,
-                messages=messages,
-                fallback_user_messages=fallback_user_messages,
-                tasks=tasks,
-                todo_snapshot=todo_snapshot,
-                interruption_message=interruption_message,
-            )
-    else:
-        for raw_line in log_text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                if interruption_message is None and _is_interruption_text(line):
-                    interruption_message = _clean_text(line)
-                continue
-
-            if not isinstance(payload, dict):
-                continue
-
-            todo_snapshot, interruption_message = _consume_summary_payload(
-                payload,
-                messages=messages,
-                fallback_user_messages=fallback_user_messages,
-                tasks=tasks,
-                todo_snapshot=todo_snapshot,
-                interruption_message=interruption_message,
-            )
 
     return _render_handoff_summary(
         messages=messages,
@@ -391,11 +404,36 @@ def _load_whole_log_payloads(text: str) -> tuple[dict[str, object], ...] | None:
     except json.JSONDecodeError:
         return None
 
+    return _coerce_summary_payloads(payload)
+
+
+def _coerce_summary_payloads(payload: object) -> tuple[dict[str, object], ...]:
     if isinstance(payload, dict):
         return (payload,)
     if isinstance(payload, list):
         return tuple(item for item in payload if isinstance(item, dict))
     return ()
+
+
+def _consume_summary_payloads(
+    payloads: tuple[dict[str, object], ...],
+    *,
+    messages: list[str],
+    fallback_user_messages: list[str],
+    tasks: deque[_TaskSnapshot],
+    todo_snapshot: _TodoSnapshot | None,
+    interruption_message: str | None,
+) -> tuple[_TodoSnapshot | None, str | None]:
+    for payload in payloads:
+        todo_snapshot, interruption_message = _consume_summary_payload(
+            payload,
+            messages=messages,
+            fallback_user_messages=fallback_user_messages,
+            tasks=tasks,
+            todo_snapshot=todo_snapshot,
+            interruption_message=interruption_message,
+        )
+    return todo_snapshot, interruption_message
 
 
 def _consume_summary_payload(
