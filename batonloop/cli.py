@@ -217,15 +217,6 @@ def _add_handoff_summary_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def build_handoff_summary_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="batonloop handoff-summary",
-        description="Print the extracted resume handoff summary for an iteration log.",
-    )
-    _add_handoff_summary_arguments(parser)
-    return parser
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     argv = tuple(sys.argv[1:] if argv is None else argv)
     parser = build_parser()

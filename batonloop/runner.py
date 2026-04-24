@@ -48,6 +48,32 @@ class ProviderSlot:
     execution: ProviderExecution
 
 
+@dataclass(frozen=True, slots=True)
+class IterationExecution:
+    number: int
+    slot: ProviderSlot
+    prompt_path: Path
+    prompt_input_path: Path
+    log_path: Path
+    result: CommandResult
+
+
+@dataclass(frozen=True, slots=True)
+class IterationOutcome:
+    exit_code: int
+    success: bool
+    iteration_cost: Decimal = field(default_factory=lambda: Decimal("0"))
+    failure_message: str | None = None
+    stop_reason: str | None = None
+    exit_status: int = 0
+    should_break: bool = False
+    wait_seconds: int = 0
+    reset_error_count: bool = False
+    skip_pause_after_wait: bool = False
+    failover_target_provider: str | None = None
+    next_provider_index: int | None = None
+
+
 class _OutputPump(threading.Thread):
     def __init__(
         self,
@@ -172,12 +198,6 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
             state.attempted_iterations += 1
             iteration_number = state.attempted_iterations
             current_slot = provider_slots[current_provider_index]
-            logger.info(
-                "--- Iteration %s starting with provider %s ---",
-                iteration_number,
-                current_slot.execution.name,
-            )
-
             prompt_index = state.completed_iterations % len(config.prompt_sequence)
             current_prompt = config.prompt_sequence[prompt_index]
 
@@ -186,208 +206,66 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 exit_status = 1
                 break
 
-            if len(config.prompt_sequence) > 1:
-                logger.info(
-                    "Prompt [%s/%s]: %s",
-                    prompt_index + 1,
-                    len(config.prompt_sequence),
-                    current_prompt.name,
-                )
-
-            iteration_log = config.log_dir / f"iteration-{iteration_number:06d}.json"
-            prompt_input_path = _prepare_iteration_prompt(
+            iteration = _execute_iteration(
+                logger=logger,
                 config=config,
-                provider_execution=current_slot.execution,
-                base_prompt_path=current_prompt,
-                log_path=iteration_log,
+                controller=controller,
+                slot=current_slot,
+                iteration_number=iteration_number,
+                prompt_index=prompt_index,
+                prompt_path=current_prompt,
                 resume_context=resume_context,
             )
-            iteration_result = _run_iteration(
-                provider=current_slot.provider,
-                execution=current_slot.execution,
+            outcome = _handle_iteration_outcome(
+                logger=logger,
                 config=config,
-                prompt_path=prompt_input_path,
-                log_path=iteration_log,
+                state=state,
                 controller=controller,
+                iteration=iteration,
+                provider_slots=provider_slots,
+                current_provider_index=current_provider_index,
             )
-            exit_code = iteration_result.exit_code
-            logger.info("Exit code: %s", exit_code)
-            iteration_cost = Decimal("0")
-            failure_message = None
-            stop_reason = None
-            success = False
-            wait_seconds = 0
-            reset_error_count = False
-            skip_pause_after_wait = False
-            should_break = False
-            failover_target_provider = None
-            switched_provider = False
-
-            if iteration_result.timed_out:
-                state.consecutive_errors += 1
-                failure_message = (
-                    "Iteration "
-                    f"{iteration_number} timed out after "
-                    f"{_format_minutes_limit(config.iteration_timeout_minutes)} and was terminated."
-                )
-                logger.warning(
-                    "Iteration %s timed out after %s and was terminated.",
-                    iteration_number,
-                    _format_minutes_limit(config.iteration_timeout_minutes),
-                )
-
-                if state.consecutive_errors >= config.max_consecutive_errors:
-                    stop_reason = (
-                        f"FATAL: {config.max_consecutive_errors} consecutive errors. Stopping."
-                    )
-                    logger.error(stop_reason)
-                    exit_status = 1
-                    should_break = True
-            elif exit_code == 0:
-                success = True
-                state.consecutive_errors = 0
-                state.completed_iterations += 1
-                logger.info("Iteration %s completed successfully.", iteration_number)
-
-                iteration_cost = current_slot.provider.extract_cost(
-                    iteration_log,
-                    config.output_format,
-                )
-                if iteration_cost != 0:
-                    state.total_cost += iteration_cost
-                    logger.info(
-                        "Iteration cost: $%s | Total: $%s",
-                        _format_decimal(iteration_cost),
-                        _format_decimal(state.total_cost),
-                    )
-
-                stop_reason = _evaluate_post_iteration_stop(
-                    logger=logger,
-                    config=config,
-                    controller=controller,
-                    iteration=iteration_number,
-                    iteration_log=iteration_log,
-                )
-
-                if stop_reason:
-                    logger.info(stop_reason)
-                    should_break = True
-                elif config.max_cost and state.total_cost >= config.max_cost:
-                    stop_reason = (
-                        "STOP: Cost limit reached "
-                        f"(${_format_decimal(state.total_cost)} >= ${_format_decimal(config.max_cost)})"
-                    )
-                    logger.info(
-                        "STOP: Cost limit reached ($%s >= $%s)",
-                        _format_decimal(state.total_cost),
-                        _format_decimal(config.max_cost),
-                    )
-                    should_break = True
-            else:
-                decision = current_slot.provider.classify_failure(
-                    exit_code,
-                    iteration_log,
-                    config,
-                    current_slot.execution,
-                )
-                next_provider_index = current_provider_index + 1
-                has_remaining_attempt_budget = (
-                    config.max_iterations == 0
-                    or state.attempted_iterations < config.max_iterations
-                )
-                can_failover = (
-                    decision.should_failover
-                    and next_provider_index < len(provider_slots)
-                    and has_remaining_attempt_budget
-                )
-
-                if can_failover:
-                    failure_message = decision.message
-                    failover_target_provider = provider_slots[next_provider_index].execution.name
-                    logger.warning(decision.message)
-                    logger.info(
-                        "AUTO FAILOVER: Switching provider from %s to %s.",
-                        current_slot.execution.name,
-                        failover_target_provider,
-                    )
-                    switched_provider = True
-                elif decision.fatal:
-                    failure_message = decision.message
-                    logger.error(decision.message)
-                    exit_status = 1
-                    stop_reason = decision.message
-                    should_break = True
-                else:
-                    state.consecutive_errors += 1
-                    if state.consecutive_errors >= config.max_consecutive_errors:
-                        failure_message = decision.message
-                        logger.warning(failure_message)
-                        stop_reason = (
-                            f"FATAL: {config.max_consecutive_errors} consecutive errors. Stopping."
-                        )
-                        logger.error(stop_reason)
-                        exit_status = 1
-                        should_break = True
-                    elif has_remaining_attempt_budget:
-                        failure_message = decision.message
-                        logger.warning(failure_message)
-                        wait_seconds = decision.wait_seconds
-                        reset_error_count = decision.reset_error_count
-                        skip_pause_after_wait = decision.skip_pause
-                    else:
-                        failure_message = (
-                            f"{decision.message} Iteration limit reached before another retry."
-                        )
-                        logger.warning(failure_message)
-
-            if (
-                not should_break
-                and config.max_iterations
-                and state.attempted_iterations >= config.max_iterations
-            ):
-                stop_reason = f"STOP: Iteration limit reached ({config.max_iterations})"
-                logger.info(stop_reason)
-                should_break = True
+            exit_status = max(exit_status, outcome.exit_status)
 
             write_iteration_metadata(
-                log_path=iteration_log,
-                execution=current_slot.execution,
+                log_path=iteration.log_path,
+                execution=iteration.slot.execution,
                 working_dir=config.working_dir,
                 log_dir=config.log_dir,
-                base_prompt_path=current_prompt,
-                input_prompt_path=prompt_input_path,
+                base_prompt_path=iteration.prompt_path,
+                input_prompt_path=iteration.prompt_input_path,
                 output_format=config.output_format.value,
-                exit_code=exit_code,
-                timed_out=iteration_result.timed_out,
-                success=success,
-                iteration_cost=iteration_cost,
-                failure_message=failure_message,
-                stop_reason=stop_reason,
-                failover_target_provider=failover_target_provider,
+                exit_code=outcome.exit_code,
+                timed_out=iteration.result.timed_out,
+                success=outcome.success,
+                iteration_cost=outcome.iteration_cost,
+                failure_message=outcome.failure_message,
+                stop_reason=outcome.stop_reason,
+                failover_target_provider=outcome.failover_target_provider,
                 resume_context=resume_context,
                 resume_note=config.resume_note,
             )
 
-            if success:
+            if outcome.success:
                 _rotate_logs(config.log_dir, config.log_retain)
 
-            if switched_provider:
-                current_provider_index += 1
+            if outcome.next_provider_index is not None:
+                current_provider_index = outcome.next_provider_index
                 state.consecutive_errors = 0
-                resume_context = resolve_resume_context(iteration_log)
+                resume_context = resolve_resume_context(iteration.log_path)
                 continue
 
-            if should_break:
+            if outcome.should_break:
                 break
 
-            if wait_seconds > 0:
-                _interruptible_sleep(wait_seconds, controller)
-                if reset_error_count:
+            if outcome.wait_seconds > 0:
+                _interruptible_sleep(outcome.wait_seconds, controller)
+                if outcome.reset_error_count:
                     state.consecutive_errors = 0
-                if skip_pause_after_wait:
+                if outcome.skip_pause_after_wait:
                     continue
 
-            if not success:
+            if not outcome.success:
                 logger.info(
                     "Consecutive errors: %s/%s. Retrying after pause...",
                     state.consecutive_errors,
@@ -577,6 +455,218 @@ def _check_duration(
         return False
 
     return True
+
+
+def _execute_iteration(
+    *,
+    logger: logging.Logger,
+    config: RunnerConfig,
+    controller: StopController,
+    slot: ProviderSlot,
+    iteration_number: int,
+    prompt_index: int,
+    prompt_path: Path,
+    resume_context: ResumeContext | None,
+) -> IterationExecution:
+    logger.info(
+        "--- Iteration %s starting with provider %s ---",
+        iteration_number,
+        slot.execution.name,
+    )
+    if len(config.prompt_sequence) > 1:
+        logger.info(
+            "Prompt [%s/%s]: %s",
+            prompt_index + 1,
+            len(config.prompt_sequence),
+            prompt_path.name,
+        )
+
+    iteration_log = config.log_dir / f"iteration-{iteration_number:06d}.json"
+    prompt_input_path = _prepare_iteration_prompt(
+        config=config,
+        provider_execution=slot.execution,
+        base_prompt_path=prompt_path,
+        log_path=iteration_log,
+        resume_context=resume_context,
+    )
+    result = _run_iteration(
+        provider=slot.provider,
+        execution=slot.execution,
+        config=config,
+        prompt_path=prompt_input_path,
+        log_path=iteration_log,
+        controller=controller,
+    )
+    logger.info("Exit code: %s", result.exit_code)
+    return IterationExecution(
+        number=iteration_number,
+        slot=slot,
+        prompt_path=prompt_path,
+        prompt_input_path=prompt_input_path,
+        log_path=iteration_log,
+        result=result,
+    )
+
+
+def _handle_iteration_outcome(
+    *,
+    logger: logging.Logger,
+    config: RunnerConfig,
+    state: RunState,
+    controller: StopController,
+    iteration: IterationExecution,
+    provider_slots: tuple[ProviderSlot, ...],
+    current_provider_index: int,
+) -> IterationOutcome:
+    exit_code = iteration.result.exit_code
+    iteration_cost = Decimal("0")
+    failure_message = None
+    stop_reason = None
+    success = False
+    wait_seconds = 0
+    reset_error_count = False
+    skip_pause_after_wait = False
+    should_break = False
+    exit_status = 0
+    failover_target_provider = None
+    next_provider_index = None
+
+    if iteration.result.timed_out:
+        state.consecutive_errors += 1
+        failure_message = (
+            "Iteration "
+            f"{iteration.number} timed out after "
+            f"{_format_minutes_limit(config.iteration_timeout_minutes)} and was terminated."
+        )
+        logger.warning(
+            "Iteration %s timed out after %s and was terminated.",
+            iteration.number,
+            _format_minutes_limit(config.iteration_timeout_minutes),
+        )
+
+        if state.consecutive_errors >= config.max_consecutive_errors:
+            stop_reason = f"FATAL: {config.max_consecutive_errors} consecutive errors. Stopping."
+            logger.error(stop_reason)
+            exit_status = 1
+            should_break = True
+    elif exit_code == 0:
+        success = True
+        state.consecutive_errors = 0
+        state.completed_iterations += 1
+        logger.info("Iteration %s completed successfully.", iteration.number)
+
+        iteration_cost = iteration.slot.provider.extract_cost(
+            iteration.log_path,
+            config.output_format,
+        )
+        if iteration_cost != 0:
+            state.total_cost += iteration_cost
+            logger.info(
+                "Iteration cost: $%s | Total: $%s",
+                _format_decimal(iteration_cost),
+                _format_decimal(state.total_cost),
+            )
+
+        stop_reason = _evaluate_post_iteration_stop(
+            logger=logger,
+            config=config,
+            controller=controller,
+            iteration=iteration.number,
+            iteration_log=iteration.log_path,
+        )
+
+        if stop_reason:
+            logger.info(stop_reason)
+            should_break = True
+        elif config.max_cost and state.total_cost >= config.max_cost:
+            stop_reason = (
+                "STOP: Cost limit reached "
+                f"(${_format_decimal(state.total_cost)} >= ${_format_decimal(config.max_cost)})"
+            )
+            logger.info(
+                "STOP: Cost limit reached ($%s >= $%s)",
+                _format_decimal(state.total_cost),
+                _format_decimal(config.max_cost),
+            )
+            should_break = True
+    else:
+        decision = iteration.slot.provider.classify_failure(
+            exit_code,
+            iteration.log_path,
+            config,
+            iteration.slot.execution,
+        )
+        candidate_provider_index = current_provider_index + 1
+        has_remaining_attempt_budget = (
+            config.max_iterations == 0
+            or state.attempted_iterations < config.max_iterations
+        )
+        can_failover = (
+            decision.should_failover
+            and candidate_provider_index < len(provider_slots)
+            and has_remaining_attempt_budget
+        )
+
+        if can_failover:
+            failure_message = decision.message
+            failover_target_provider = provider_slots[candidate_provider_index].execution.name
+            logger.warning(decision.message)
+            logger.info(
+                "AUTO FAILOVER: Switching provider from %s to %s.",
+                iteration.slot.execution.name,
+                failover_target_provider,
+            )
+            next_provider_index = candidate_provider_index
+        elif decision.fatal:
+            failure_message = decision.message
+            logger.error(decision.message)
+            exit_status = 1
+            stop_reason = decision.message
+            should_break = True
+        else:
+            state.consecutive_errors += 1
+            if state.consecutive_errors >= config.max_consecutive_errors:
+                failure_message = decision.message
+                logger.warning(failure_message)
+                stop_reason = f"FATAL: {config.max_consecutive_errors} consecutive errors. Stopping."
+                logger.error(stop_reason)
+                exit_status = 1
+                should_break = True
+            elif has_remaining_attempt_budget:
+                failure_message = decision.message
+                logger.warning(failure_message)
+                wait_seconds = decision.wait_seconds
+                reset_error_count = decision.reset_error_count
+                skip_pause_after_wait = decision.skip_pause
+            else:
+                failure_message = (
+                    f"{decision.message} Iteration limit reached before another retry."
+                )
+                logger.warning(failure_message)
+
+    if (
+        not should_break
+        and config.max_iterations
+        and state.attempted_iterations >= config.max_iterations
+    ):
+        stop_reason = f"STOP: Iteration limit reached ({config.max_iterations})"
+        logger.info(stop_reason)
+        should_break = True
+
+    return IterationOutcome(
+        exit_code=exit_code,
+        success=success,
+        iteration_cost=iteration_cost,
+        failure_message=failure_message,
+        stop_reason=stop_reason,
+        exit_status=exit_status,
+        should_break=should_break,
+        wait_seconds=wait_seconds,
+        reset_error_count=reset_error_count,
+        skip_pause_after_wait=skip_pause_after_wait,
+        failover_target_provider=failover_target_provider,
+        next_provider_index=next_provider_index,
+    )
 
 
 def _run_iteration(

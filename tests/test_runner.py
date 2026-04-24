@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shlex
 import subprocess
 import sys
@@ -19,7 +20,15 @@ from batonloop.config import (
 )
 from batonloop.handoff import extract_handoff_summary, metadata_path_for, prompt_artifact_path_for
 from batonloop.providers.base import FailureDecision, FailureKind
-from batonloop.runner import run_loop
+from batonloop.runner import (
+    CommandResult,
+    IterationExecution,
+    ProviderSlot,
+    RunState,
+    StopController,
+    _handle_iteration_outcome,
+    run_loop,
+)
 
 
 class RunnerTests(unittest.TestCase):
@@ -591,6 +600,78 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("STOP: Iteration limit reached (1)", log_text)
             self.assertIn("Attempts:    1", log_text)
             self.assertIn("Completed:   0", log_text)
+
+    def test_handle_iteration_outcome_returns_failover_target(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=2,
+                provider_names=("limited", "backup"),
+                provider_profiles={"backup": ProviderProfile(model="gpt-5.4")},
+            )
+            config.log_dir.mkdir()
+            iteration_log = config.log_dir / "iteration-000001.json"
+            iteration_log.write_text("rate limited", encoding="utf-8")
+            prompt_path = config.prompt_sequence[0]
+
+            logger = logging.getLogger("batonloop.test.outcome")
+            logger.handlers.clear()
+            logger.addHandler(logging.NullHandler())
+            controller = StopController(logger)
+            state = RunState(start_time=0.0, attempted_iterations=1)
+
+            limited_slot = ProviderSlot(
+                provider=RateLimitedProvider(),
+                execution=ProviderExecution(
+                    name="limited",
+                    binary=sys.executable,
+                    model=None,
+                    max_turns=None,
+                    use_bare=False,
+                    safe_mode=False,
+                ),
+            )
+            backup_slot = ProviderSlot(
+                provider=ResumeEchoProvider(),
+                execution=ProviderExecution(
+                    name="backup",
+                    binary=sys.executable,
+                    model="gpt-5.4",
+                    max_turns=None,
+                    use_bare=False,
+                    safe_mode=False,
+                ),
+            )
+            iteration = IterationExecution(
+                number=1,
+                slot=limited_slot,
+                prompt_path=prompt_path,
+                prompt_input_path=prompt_path,
+                log_path=iteration_log,
+                result=CommandResult(exit_code=1),
+            )
+
+            outcome = _handle_iteration_outcome(
+                logger=logger,
+                config=config,
+                state=state,
+                controller=controller,
+                iteration=iteration,
+                provider_slots=(limited_slot, backup_slot),
+                current_provider_index=0,
+            )
+
+            self.assertEqual(outcome.exit_code, 1)
+            self.assertFalse(outcome.success)
+            self.assertEqual(
+                outcome.failure_message,
+                "RATE LIMITED detected in output. Waiting 30 minutes before retrying...",
+            )
+            self.assertEqual(outcome.failover_target_provider, "backup")
+            self.assertEqual(outcome.next_provider_index, 1)
+            self.assertFalse(outcome.should_break)
+            self.assertEqual(state.consecutive_errors, 0)
 
 
 class StaticCommandProvider:
