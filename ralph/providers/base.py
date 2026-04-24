@@ -23,6 +23,9 @@ class Provider(Protocol):
     def executable_name(self, config: RunnerConfig) -> str:
         ...
 
+    def validate_config(self, config: RunnerConfig) -> None:
+        ...
+
     def build_command(self, config: RunnerConfig) -> list[str]:
         ...
 
@@ -36,4 +39,3 @@ class Provider(Protocol):
         config: RunnerConfig,
     ) -> FailureDecision:
         ...
-

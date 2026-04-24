@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 
 from ..config import OutputFormat, RunnerConfig
 from .base import FailureDecision
+from .utils import decimal_from_value, iter_jsonl, read_log_text
 
 
 class ClaudeProvider:
@@ -14,6 +15,9 @@ class ClaudeProvider:
 
     def executable_name(self, config: RunnerConfig) -> str:
         return config.provider_binary or self.default_binary
+
+    def validate_config(self, config: RunnerConfig) -> None:
+        del config
 
     def build_command(self, config: RunnerConfig) -> list[str]:
         command = [
@@ -49,23 +53,12 @@ class ClaudeProvider:
                 payload = json.loads(log_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return Decimal("0")
-            return _decimal_from_value(payload.get("total_cost_usd", 0))
+            return decimal_from_value(payload.get("total_cost_usd", 0))
 
         result_cost = Decimal("0")
-        try:
-            with log_path.open(encoding="utf-8", errors="ignore") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if payload.get("type") == "result":
-                        result_cost = _decimal_from_value(payload.get("total_cost_usd", 0))
-        except OSError:
-            return Decimal("0")
+        for payload in iter_jsonl(log_path):
+            if payload.get("type") == "result":
+                result_cost = decimal_from_value(payload.get("total_cost_usd", 0))
 
         return result_cost
 
@@ -84,7 +77,7 @@ class ClaudeProvider:
                 ),
             )
 
-        log_text = _read_log_text(log_path)
+        log_text = read_log_text(log_path)
 
         if exit_code == 1:
             if any(pattern in log_text for pattern in ("rate.limit", "usage.limit", "rate_limit")):
@@ -112,21 +105,3 @@ class ClaudeProvider:
         return FailureDecision(
             message=f"WARNING: Unexpected exit code {exit_code}. Check {log_path} for details."
         )
-
-
-def _read_log_text(log_path: Path) -> str:
-    try:
-        return log_path.read_text(encoding="utf-8", errors="ignore").lower()
-    except OSError:
-        return ""
-
-
-def _decimal_from_value(value: object) -> Decimal:
-    if value in (None, "", "null"):
-        return Decimal("0")
-
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return Decimal("0")
-

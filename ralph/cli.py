@@ -10,11 +10,12 @@ from .config import (
     parse_non_negative_int,
     parse_positive_int,
 )
-from .providers import ClaudeProvider
+from .providers import ClaudeProvider, CodexProvider
 from .runner import run_loop
 
 PROVIDERS = {
     "claude": ClaudeProvider(),
+    "codex": CodexProvider(),
 }
 
 
@@ -123,12 +124,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bare",
         action="store_true",
-        help="Pass the provider bare/minimal mode flag when supported.",
+        help="Use the provider's bare/minimal mode when supported.",
     )
     parser.add_argument(
         "--safe",
         action="store_true",
-        help="Omit the provider's skip-permissions flag.",
+        help="Use the provider's non-bypass/sandboxed mode when supported.",
     )
     parser.add_argument(
         "--dry-run",
@@ -148,4 +149,3 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_loop(config, provider)
     except (FileNotFoundError, ValueError) as exc:
         parser.exit(status=1, message=f"ERROR: {exc}\n")
-

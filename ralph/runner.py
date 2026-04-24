@@ -80,6 +80,7 @@ class StopController:
 
 
 def run_loop(config: RunnerConfig, provider: Provider) -> int:
+    provider.validate_config(config)
     _ensure_executable_available(provider.executable_name(config))
     config.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -375,4 +376,3 @@ def _format_money_limit(value: Decimal) -> str:
 
 def _format_duration_limit(value: Decimal) -> str:
     return "unlimited" if value == 0 else f"{_format_decimal(value)}h"
-
