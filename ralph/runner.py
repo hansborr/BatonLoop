@@ -6,13 +6,14 @@ import re
 import signal
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from shutil import which
 from types import FrameType
 
-from .config import RunnerConfig
+from .config import ProviderExecution, RunnerConfig, resolve_provider_execution
 from .handoff import (
     ResumeContext,
     build_resume_prompt,
@@ -37,6 +38,12 @@ class RunState:
 class CommandResult:
     exit_code: int
     timed_out: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSlot:
+    provider: Provider
+    execution: ProviderExecution
 
 
 class StopController:
@@ -92,10 +99,9 @@ class StopController:
         _terminate_process_tree(self._current_process, force=True)
 
 
-def run_loop(config: RunnerConfig, provider: Provider) -> int:
-    provider.validate_config(config)
+def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
     _validate_runtime_config(config)
-    _ensure_executable_available(provider.executable_name(config))
+    provider_slots = _build_provider_slots(config, providers)
     config.log_dir.mkdir(parents=True, exist_ok=True)
     resume_context = (
         resolve_resume_context(config.resume_from) if config.resume_from is not None else None
@@ -105,10 +111,11 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
     controller = StopController(logger)
     state = RunState(start_time=time.monotonic())
     exit_status = 0
+    current_provider_index = 0
 
     controller.install()
     try:
-        _log_startup(logger, config, provider)
+        _log_startup(logger, config, provider_slots)
 
         if config.dry_run:
             logger.info("Dry run - exiting.")
@@ -128,7 +135,12 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
             if not _check_duration(logger, config, state):
                 break
 
-            logger.info("--- Iteration %s starting ---", state.iteration)
+            current_slot = provider_slots[current_provider_index]
+            logger.info(
+                "--- Iteration %s starting with provider %s ---",
+                state.iteration,
+                current_slot.execution.name,
+            )
 
             prompt_index = state.completed_iterations % len(config.prompt_sequence)
             current_prompt = config.prompt_sequence[prompt_index]
@@ -149,13 +161,14 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
             iteration_log = config.log_dir / f"iteration-{state.iteration:06d}.json"
             prompt_input_path = _prepare_iteration_prompt(
                 config=config,
-                provider=provider,
+                provider_execution=current_slot.execution,
                 base_prompt_path=current_prompt,
                 log_path=iteration_log,
                 resume_context=resume_context,
             )
             iteration_result = _run_iteration(
-                provider=provider,
+                provider=current_slot.provider,
+                execution=current_slot.execution,
                 config=config,
                 prompt_path=prompt_input_path,
                 log_path=iteration_log,
@@ -171,6 +184,8 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
             reset_error_count = False
             skip_pause_after_wait = False
             should_break = False
+            failover_target_provider = None
+            switched_provider = False
 
             if iteration_result.timed_out:
                 state.consecutive_errors += 1
@@ -198,7 +213,10 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
                 state.completed_iterations += 1
                 logger.info("Iteration %s completed successfully.", state.iteration)
 
-                iteration_cost = provider.extract_cost(iteration_log, config.output_format)
+                iteration_cost = current_slot.provider.extract_cost(
+                    iteration_log,
+                    config.output_format,
+                )
                 if iteration_cost != 0:
                     state.total_cost += iteration_cost
                     logger.info(
@@ -230,9 +248,26 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
                     )
                     should_break = True
             else:
-                decision = provider.classify_failure(exit_code, iteration_log, config)
+                decision = current_slot.provider.classify_failure(
+                    exit_code,
+                    iteration_log,
+                    config,
+                    current_slot.execution,
+                )
                 failure_message = decision.message
-                if decision.fatal:
+                next_provider_index = current_provider_index + 1
+                can_failover = decision.should_failover and next_provider_index < len(provider_slots)
+
+                if can_failover:
+                    failover_target_provider = provider_slots[next_provider_index].execution.name
+                    logger.warning(decision.message)
+                    logger.info(
+                        "AUTO FAILOVER: Switching provider from %s to %s.",
+                        current_slot.execution.name,
+                        failover_target_provider,
+                    )
+                    switched_provider = True
+                elif decision.fatal:
                     logger.error(decision.message)
                     exit_status = 1
                     stop_reason = decision.message
@@ -255,7 +290,7 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
 
             write_iteration_metadata(
                 log_path=iteration_log,
-                provider_name=provider.name,
+                execution=current_slot.execution,
                 working_dir=config.working_dir,
                 log_dir=config.log_dir,
                 base_prompt_path=current_prompt,
@@ -267,12 +302,19 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
                 iteration_cost=iteration_cost,
                 failure_message=failure_message,
                 stop_reason=stop_reason,
+                failover_target_provider=failover_target_provider,
                 resume_context=resume_context,
                 resume_note=config.resume_note,
             )
 
             if success:
                 _rotate_logs(config.log_dir, config.log_retain)
+
+            if switched_provider:
+                current_provider_index += 1
+                state.consecutive_errors = 0
+                resume_context = resolve_resume_context(iteration_log)
+                continue
 
             if should_break:
                 break
@@ -358,10 +400,48 @@ def _validate_runtime_config(config: RunnerConfig) -> None:
             raise ValueError("--stop-on-clean-git requires running inside a Git worktree.")
 
 
-def _log_startup(logger: logging.Logger, config: RunnerConfig, provider: Provider) -> None:
+def _build_provider_slots(
+    config: RunnerConfig,
+    providers: Mapping[str, Provider],
+) -> tuple[ProviderSlot, ...]:
+    slots: list[ProviderSlot] = []
+    for provider_name in config.provider_names:
+        provider = providers.get(provider_name)
+        if provider is None:
+            raise ValueError(f"Unknown provider configured for this run: {provider_name}")
+        execution = resolve_provider_execution(config, provider_name)
+        provider.validate_config(config, execution)
+        _ensure_executable_available(provider.executable_name(execution))
+        slots.append(ProviderSlot(provider=provider, execution=execution))
+    return tuple(slots)
+
+
+def _log_startup(
+    logger: logging.Logger,
+    config: RunnerConfig,
+    provider_slots: tuple[ProviderSlot, ...],
+) -> None:
     logger.info("=== Ralph Loop Starting ===")
-    logger.info("Provider:        %s", provider.name)
-    logger.info("Executable:      %s", provider.executable_name(config))
+    logger.info(
+        "Providers:       %s",
+        " -> ".join(slot.execution.name for slot in provider_slots),
+    )
+    logger.info(
+        "Provider config: %s",
+        config.provider_config_path if config.provider_config_path else "none",
+    )
+    for index, slot in enumerate(provider_slots, start=1):
+        logger.info(
+            "  [provider %s/%s] name=%s binary=%s model=%s max_turns=%s bare=%s safe=%s",
+            index,
+            len(provider_slots),
+            slot.execution.name,
+            slot.provider.executable_name(slot.execution),
+            slot.execution.model or "default",
+            slot.execution.max_turns if slot.execution.max_turns is not None else "unset",
+            slot.execution.use_bare,
+            slot.execution.safe_mode,
+        )
     logger.info("Working dir:     %s", config.working_dir)
 
     if len(config.prompt_sequence) == 1:
@@ -376,13 +456,9 @@ def _log_startup(logger: logging.Logger, config: RunnerConfig, provider: Provide
     logger.info("Max duration:    %s", _format_duration_limit(config.max_duration_hours))
     logger.info("Iter timeout:    %s", _format_minutes_limit(config.iteration_timeout_minutes))
     logger.info("Pause between:   %ss", config.pause_seconds)
-    logger.info("Model:           %s", config.model or "default")
     logger.info("Rate limit wait: %sm", config.wait_on_limit_mins)
     logger.info("Max errors:      %s", config.max_consecutive_errors)
-    logger.info("Max turns:       %s", config.max_turns if config.max_turns is not None else "unset")
     logger.info("Output format:   %s", config.output_format.value)
-    logger.info("Bare mode:       %s", config.use_bare)
-    logger.info("Safe mode:       %s", config.safe_mode)
     logger.info("Resume from:     %s", config.resume_from if config.resume_from else "none")
     logger.info("Resume note:     %s", config.resume_note or "none")
     logger.info("Log directory:   %s", config.log_dir)
@@ -442,12 +518,13 @@ def _check_duration(
 
 def _run_iteration(
     provider: Provider,
+    execution: ProviderExecution,
     config: RunnerConfig,
     prompt_path: Path,
     log_path: Path,
     controller: StopController,
 ) -> CommandResult:
-    command = provider.build_command(config)
+    command = provider.build_command(config, execution)
     return _run_subprocess(
         command=command,
         cwd=config.working_dir,
@@ -461,7 +538,7 @@ def _run_iteration(
 def _prepare_iteration_prompt(
     *,
     config: RunnerConfig,
-    provider: Provider,
+    provider_execution: ProviderExecution,
     base_prompt_path: Path,
     log_path: Path,
     resume_context: ResumeContext | None,
@@ -471,7 +548,7 @@ def _prepare_iteration_prompt(
 
     prompt_text = build_resume_prompt(
         base_prompt_path=base_prompt_path,
-        current_provider_name=provider.name,
+        current_provider_name=provider_execution.name,
         working_dir=config.working_dir,
         log_dir=config.log_dir,
         resume_context=resume_context,

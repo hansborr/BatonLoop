@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ralph.config import OutputFormat, build_config, parse_prompt_spec
+from ralph.config import OutputFormat, build_config, parse_prompt_spec, resolve_provider_execution
 
 
 class PromptSpecTests(unittest.TestCase):
@@ -25,12 +25,27 @@ class PromptSpecTests(unittest.TestCase):
             temp_root = Path(tmp_dir)
             prompt_path = temp_root / "PROMPT.md"
             review_path = temp_root / "REVIEW.md"
+            provider_config_path = temp_root / "ralph-providers.toml"
             prompt_path.write_text("develop", encoding="utf-8")
             review_path.write_text("review", encoding="utf-8")
+            provider_config_path.write_text(
+                "\n".join(
+                    [
+                        "[providers.claude]",
+                        'model = "opus"',
+                        "",
+                        "[providers.codex]",
+                        'model = "gpt-5.4"',
+                        "safe = true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             config = build_config(
                 Namespace(
-                    provider="claude",
+                    provider_names=["claude", "codex"],
+                    provider_config=str(provider_config_path),
                     provider_binary=None,
                     prompt_specs=[f"{prompt_path}:2", str(review_path)],
                     max_iterations=0,
@@ -50,8 +65,8 @@ class PromptSpecTests(unittest.TestCase):
                     stop_when_files=[str(temp_root / "done.flag")],
                     output_format=OutputFormat.STREAM_JSON.value,
                     no_stream=False,
-                    bare=False,
-                    safe=False,
+                    bare=None,
+                    safe=None,
                     resume_from=str(temp_root / "old-logs"),
                     resume_note="resume after usage limit",
                     dry_run=False,
@@ -67,8 +82,13 @@ class PromptSpecTests(unittest.TestCase):
             self.assertEqual(config.check_commands, ("pytest -q",))
             self.assertEqual(config.stop_on_regexes, ("DONE",))
             self.assertEqual(config.stop_when_files, (temp_root / "done.flag",))
+            self.assertEqual(config.provider_names, ("claude", "codex"))
+            self.assertEqual(config.provider_config_path, provider_config_path)
             self.assertEqual(config.resume_from, temp_root / "old-logs")
             self.assertEqual(config.resume_note, "resume after usage limit")
+            self.assertEqual(resolve_provider_execution(config, "claude").model, "opus")
+            self.assertEqual(resolve_provider_execution(config, "codex").model, "gpt-5.4")
+            self.assertTrue(resolve_provider_execution(config, "codex").safe_mode)
 
 
 if __name__ == "__main__":

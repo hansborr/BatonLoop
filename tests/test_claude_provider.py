@@ -6,8 +6,14 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ralph.config import OutputFormat, PromptSpec, RunnerConfig
-from ralph.providers import ClaudeProvider
+from ralph.config import (
+    OutputFormat,
+    PromptSpec,
+    ProviderProfile,
+    RunnerConfig,
+    resolve_provider_execution,
+)
+from ralph.providers import ClaudeProvider, FailureKind
 
 
 class ClaudeProviderTests(unittest.TestCase):
@@ -17,7 +23,8 @@ class ClaudeProviderTests(unittest.TestCase):
     def test_build_command_matches_claude_flags(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             config = _make_config(Path(tmp_dir))
-            command = self.provider.build_command(config)
+            execution = resolve_provider_execution(config, "claude")
+            command = self.provider.build_command(config, execution)
 
         self.assertEqual(
             command,
@@ -57,16 +64,20 @@ class ClaudeProviderTests(unittest.TestCase):
             temp_root = Path(tmp_dir)
             log_path = temp_root / "iteration-000001.json"
             log_path.write_text("hit rate_limit while calling API", encoding="utf-8")
+            config = _make_config(temp_root)
             decision = self.provider.classify_failure(
                 exit_code=1,
                 log_path=log_path,
-                config=_make_config(temp_root),
+                config=config,
+                execution=resolve_provider_execution(config, "claude"),
             )
 
         self.assertFalse(decision.fatal)
+        self.assertEqual(decision.kind, FailureKind.RATE_LIMIT)
         self.assertEqual(decision.wait_seconds, 1800)
         self.assertTrue(decision.reset_error_count)
         self.assertTrue(decision.skip_pause)
+        self.assertTrue(decision.should_failover)
 
 
 def _make_config(temp_root: Path) -> RunnerConfig:
@@ -74,8 +85,10 @@ def _make_config(temp_root: Path) -> RunnerConfig:
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
         working_dir=temp_root,
-        provider_name="claude",
-        provider_binary=None,
+        provider_names=("claude",),
+        provider_profiles={"claude": ProviderProfile(model="sonnet", max_turns=7)},
+        provider_config_path=None,
+        default_provider_profile=ProviderProfile(),
         prompt_specs=(PromptSpec(path=prompt_path, repeat=1),),
         prompt_sequence=(prompt_path,),
         max_iterations=0,
@@ -83,10 +96,8 @@ def _make_config(temp_root: Path) -> RunnerConfig:
         max_duration_hours=Decimal("0"),
         iteration_timeout_minutes=Decimal("0"),
         pause_seconds=5,
-        model="sonnet",
         wait_on_limit_mins=30,
         max_consecutive_errors=5,
-        max_turns=7,
         log_dir=temp_root / "logs",
         log_retain=0,
         check_commands=(),
@@ -94,8 +105,6 @@ def _make_config(temp_root: Path) -> RunnerConfig:
         stop_on_clean_git=False,
         stop_when_files=(),
         output_format=OutputFormat.STREAM_JSON,
-        use_bare=False,
-        safe_mode=False,
         resume_from=None,
         resume_note=None,
         dry_run=False,

@@ -6,8 +6,14 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ralph.config import OutputFormat, PromptSpec, RunnerConfig
-from ralph.providers import CodexProvider
+from ralph.config import (
+    OutputFormat,
+    PromptSpec,
+    ProviderProfile,
+    RunnerConfig,
+    resolve_provider_execution,
+)
+from ralph.providers import CodexProvider, FailureKind
 
 
 class CodexProviderTests(unittest.TestCase):
@@ -17,7 +23,8 @@ class CodexProviderTests(unittest.TestCase):
     def test_build_command_uses_bypass_mode_by_default(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             config = _make_config(Path(tmp_dir))
-            command = self.provider.build_command(config)
+            execution = resolve_provider_execution(config, "codex")
+            command = self.provider.build_command(config, execution)
 
         self.assertEqual(
             command,
@@ -42,7 +49,8 @@ class CodexProviderTests(unittest.TestCase):
                 use_bare=True,
                 model=None,
             )
-            command = self.provider.build_command(config)
+            execution = resolve_provider_execution(config, "codex")
+            command = self.provider.build_command(config, execution)
 
         self.assertEqual(
             command,
@@ -63,11 +71,17 @@ class CodexProviderTests(unittest.TestCase):
         with TemporaryDirectory() as tmp_dir:
             json_config = _make_config(Path(tmp_dir), output_format=OutputFormat.JSON)
             with self.assertRaisesRegex(ValueError, "stream-json"):
-                self.provider.validate_config(json_config)
+                self.provider.validate_config(
+                    json_config,
+                    resolve_provider_execution(json_config, "codex"),
+                )
 
             turn_limited_config = _make_config(Path(tmp_dir), max_turns=7)
             with self.assertRaisesRegex(ValueError, "max-turns"):
-                self.provider.validate_config(turn_limited_config)
+                self.provider.validate_config(
+                    turn_limited_config,
+                    resolve_provider_execution(turn_limited_config, "codex"),
+                )
 
     def test_extract_cost_reads_nested_usage_cost_when_present(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -94,14 +108,18 @@ class CodexProviderTests(unittest.TestCase):
                 '{"type":"error","message":"{\\"type\\":\\"error\\",\\"status\\":400,\\"error\\":{\\"type\\":\\"invalid_request_error\\"}}"}',
                 encoding="utf-8",
             )
+            config = _make_config(temp_root)
 
             decision = self.provider.classify_failure(
                 exit_code=1,
                 log_path=log_path,
-                config=_make_config(temp_root),
+                config=config,
+                execution=resolve_provider_execution(config, "codex"),
             )
 
         self.assertTrue(decision.fatal)
+        self.assertEqual(decision.kind, FailureKind.INVALID_REQUEST)
+        self.assertTrue(decision.should_failover)
 
 
 def _make_config(
@@ -117,8 +135,17 @@ def _make_config(
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
         working_dir=temp_root,
-        provider_name="codex",
-        provider_binary=None,
+        provider_names=("codex",),
+        provider_profiles={
+            "codex": ProviderProfile(
+                model=model,
+                max_turns=max_turns,
+                use_bare=use_bare,
+                safe_mode=safe_mode,
+            )
+        },
+        provider_config_path=None,
+        default_provider_profile=ProviderProfile(),
         prompt_specs=(PromptSpec(path=prompt_path, repeat=1),),
         prompt_sequence=(prompt_path,),
         max_iterations=0,
@@ -126,10 +153,8 @@ def _make_config(
         max_duration_hours=Decimal("0"),
         iteration_timeout_minutes=Decimal("0"),
         pause_seconds=5,
-        model=model,
         wait_on_limit_mins=30,
         max_consecutive_errors=5,
-        max_turns=max_turns,
         log_dir=temp_root / "logs",
         log_retain=0,
         check_commands=(),
@@ -137,8 +162,6 @@ def _make_config(
         stop_on_clean_git=False,
         stop_when_files=(),
         output_format=output_format,
-        use_bare=use_bare,
-        safe_mode=safe_mode,
         resume_from=None,
         resume_note=None,
         dry_run=False,

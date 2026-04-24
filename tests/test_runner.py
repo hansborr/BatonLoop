@@ -9,9 +9,9 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ralph.config import OutputFormat, PromptSpec, RunnerConfig
+from ralph.config import OutputFormat, PromptSpec, ProviderExecution, ProviderProfile, RunnerConfig
 from ralph.handoff import metadata_path_for, prompt_artifact_path_for
-from ralph.providers.base import FailureDecision
+from ralph.providers.base import FailureDecision, FailureKind
 from ralph.runner import run_loop
 
 
@@ -24,11 +24,11 @@ class RunnerTests(unittest.TestCase):
                 iteration_timeout_minutes=Decimal("0.001"),
                 max_consecutive_errors=1,
             )
-            provider = FakeProvider(
+            provider = StaticCommandProvider(
                 [sys.executable, "-c", "import time; time.sleep(1)"],
             )
 
-            exit_code = run_loop(config, provider)
+            exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 1)
             log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
@@ -41,11 +41,11 @@ class RunnerTests(unittest.TestCase):
                 temp_root,
                 check_commands=(f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(0)'",),
             )
-            provider = FakeProvider(
+            provider = StaticCommandProvider(
                 [sys.executable, "-c", "print('work complete')"],
             )
 
-            exit_code = run_loop(config, provider)
+            exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 0)
             self.assertTrue((config.log_dir / "iteration-000001-check-01.log").is_file())
@@ -56,9 +56,9 @@ class RunnerTests(unittest.TestCase):
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
             config = _make_config(temp_root, stop_on_regexes=("DONE",))
-            provider = FakeProvider([sys.executable, "-c", "print('DONE')"])
+            provider = StaticCommandProvider([sys.executable, "-c", "print('DONE')"])
 
-            exit_code = run_loop(config, provider)
+            exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 0)
             log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
@@ -69,7 +69,7 @@ class RunnerTests(unittest.TestCase):
             temp_root = Path(tmp_dir)
             marker_path = temp_root / "DONE.flag"
             config = _make_config(temp_root, stop_when_files=(marker_path,))
-            provider = FakeProvider(
+            provider = StaticCommandProvider(
                 [
                     sys.executable,
                     "-c",
@@ -77,7 +77,7 @@ class RunnerTests(unittest.TestCase):
                 ],
             )
 
-            exit_code = run_loop(config, provider)
+            exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 0)
             self.assertTrue(marker_path.exists())
@@ -107,9 +107,9 @@ class RunnerTests(unittest.TestCase):
             )
 
             config = _make_config(temp_root, stop_on_clean_git=True)
-            provider = FakeProvider([sys.executable, "-c", "print('no repo changes')"])
+            provider = StaticCommandProvider([sys.executable, "-c", "print('no repo changes')"])
 
-            exit_code = run_loop(config, provider)
+            exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 0)
             log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
@@ -143,9 +143,9 @@ class RunnerTests(unittest.TestCase):
                 resume_from=previous_logs,
                 resume_note="Switch providers and continue from the partial work.",
             )
-            provider = FakeProvider([sys.executable, "-c", "import sys; print(sys.stdin.read())"])
+            provider = StaticCommandProvider([sys.executable, "-c", "import sys; print(sys.stdin.read())"])
 
-            exit_code = run_loop(config, provider)
+            exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 0)
             current_log = config.log_dir / "iteration-000001.json"
@@ -165,11 +165,11 @@ class RunnerTests(unittest.TestCase):
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
             config = _make_config(temp_root, max_consecutive_errors=1, max_iterations=1)
-            provider = FakeProvider(
+            provider = StaticCommandProvider(
                 [sys.executable, "-c", "import sys; print('boom'); sys.exit(1)"],
             )
 
-            exit_code = run_loop(config, provider)
+            exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 1)
             metadata = json.loads(
@@ -182,24 +182,69 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(metadata["success"])
             self.assertEqual(metadata["failure_message"], "process failed with exit code 1")
             self.assertEqual(metadata["resume_source_log_path"], None)
+            self.assertEqual(metadata["failover_target_provider"], None)
             self.assertIn("git_status", metadata)
 
+    def test_rate_limit_failure_automatically_fails_over_to_next_provider(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=1,
+                provider_names=("limited", "backup"),
+                provider_profiles={"backup": ProviderProfile(model="gpt-5.4")},
+            )
+            providers = {
+                "limited": RateLimitedProvider(),
+                "backup": ResumeEchoProvider(),
+            }
 
-class FakeProvider:
+            exit_code = run_loop(config, providers)
+
+            self.assertEqual(exit_code, 0)
+            first_iteration_metadata = json.loads(
+                metadata_path_for(config.log_dir / "iteration-000001.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(first_iteration_metadata["provider_name"], "limited")
+            self.assertEqual(first_iteration_metadata["failover_target_provider"], "backup")
+
+            second_iteration_log = config.log_dir / "iteration-000002.json"
+            second_prompt_artifact = prompt_artifact_path_for(second_iteration_log)
+            second_log_text = second_iteration_log.read_text(encoding="utf-8")
+            self.assertTrue(second_prompt_artifact.is_file())
+            self.assertIn("MODEL=gpt-5.4", second_log_text)
+            self.assertIn("=== RALPH RESUME CONTEXT ===", second_log_text)
+            self.assertIn(
+                f"Previous raw log: {config.log_dir / 'iteration-000001.json'}",
+                second_log_text,
+            )
+            self.assertIn("Current provider: backup", second_log_text)
+            self.assertIn("Previous provider: limited", second_log_text)
+
+
+class StaticCommandProvider:
     name = "fake"
 
-    def __init__(self, command: list[str]) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        failure_decision: FailureDecision | None = None,
+    ) -> None:
         self._command = command
+        self._failure_decision = failure_decision
 
-    def executable_name(self, config: RunnerConfig) -> str:
-        del config
+    def executable_name(self, execution: ProviderExecution) -> str:
+        del execution
         return self._command[0]
 
-    def validate_config(self, config: RunnerConfig) -> None:
-        del config
+    def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
+        del config, execution
 
-    def build_command(self, config: RunnerConfig) -> list[str]:
-        del config
+    def build_command(self, config: RunnerConfig, execution: ProviderExecution) -> list[str]:
+        del config, execution
         return self._command
 
     def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:
@@ -211,9 +256,82 @@ class FakeProvider:
         exit_code: int,
         log_path: Path,
         config: RunnerConfig,
+        execution: ProviderExecution,
     ) -> FailureDecision:
-        del log_path, config
+        del log_path, config, execution
+        if self._failure_decision is not None:
+            return self._failure_decision
         return FailureDecision(message=f"process failed with exit code {exit_code}")
+
+
+class RateLimitedProvider:
+    name = "limited"
+
+    def executable_name(self, execution: ProviderExecution) -> str:
+        del execution
+        return sys.executable
+
+    def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
+        del config, execution
+
+    def build_command(self, config: RunnerConfig, execution: ProviderExecution) -> list[str]:
+        del config, execution
+        return [sys.executable, "-c", "import sys; print('rate limited'); sys.exit(1)"]
+
+    def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:
+        del log_path, output_format
+        return Decimal("0")
+
+    def classify_failure(
+        self,
+        exit_code: int,
+        log_path: Path,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> FailureDecision:
+        del exit_code, log_path, config, execution
+        return FailureDecision(
+            message="RATE LIMITED detected in output. Waiting 30 minutes before retrying...",
+            kind=FailureKind.RATE_LIMIT,
+            wait_seconds=1800,
+            reset_error_count=True,
+            skip_pause=True,
+            should_failover=True,
+        )
+
+
+class ResumeEchoProvider:
+    name = "backup"
+
+    def executable_name(self, execution: ProviderExecution) -> str:
+        del execution
+        return sys.executable
+
+    def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
+        del config, execution
+
+    def build_command(self, config: RunnerConfig, execution: ProviderExecution) -> list[str]:
+        del config
+        return [
+            sys.executable,
+            "-c",
+            "import sys; print('MODEL=' + sys.argv[1]); print(sys.stdin.read())",
+            execution.model or "none",
+        ]
+
+    def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:
+        del log_path, output_format
+        return Decimal("0")
+
+    def classify_failure(
+        self,
+        exit_code: int,
+        log_path: Path,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> FailureDecision:
+        del exit_code, log_path, config, execution
+        return FailureDecision(message="unexpected failure")
 
 
 def _make_config(
@@ -228,13 +346,17 @@ def _make_config(
     max_consecutive_errors: int = 5,
     resume_from: Path | None = None,
     resume_note: str | None = None,
+    provider_names: tuple[str, ...] = ("fake",),
+    provider_profiles: dict[str, ProviderProfile] | None = None,
 ) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
         working_dir=temp_root,
-        provider_name="fake",
-        provider_binary=None,
+        provider_names=provider_names,
+        provider_profiles=provider_profiles or {},
+        provider_config_path=None,
+        default_provider_profile=ProviderProfile(),
         prompt_specs=(PromptSpec(path=prompt_path, repeat=1),),
         prompt_sequence=(prompt_path,),
         max_iterations=max_iterations,
@@ -242,10 +364,8 @@ def _make_config(
         max_duration_hours=Decimal("0"),
         iteration_timeout_minutes=iteration_timeout_minutes,
         pause_seconds=0,
-        model=None,
         wait_on_limit_mins=30,
         max_consecutive_errors=max_consecutive_errors,
-        max_turns=None,
         log_dir=temp_root / "ralph-logs",
         log_retain=0,
         check_commands=check_commands,
@@ -253,8 +373,6 @@ def _make_config(
         stop_on_clean_git=stop_on_clean_git,
         stop_when_files=stop_when_files,
         output_format=OutputFormat.STREAM_JSON,
-        use_bare=False,
-        safe_mode=False,
         resume_from=resume_from,
         resume_note=resume_note,
         dry_run=False,

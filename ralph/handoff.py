@@ -8,6 +8,8 @@ from decimal import Decimal
 from pathlib import Path
 from shutil import which
 
+from .config import ProviderExecution
+
 
 _ITERATION_LOG_FILENAME = re.compile(r"^(iteration-\d{6})\.json$")
 _ITERATION_ARTIFACT_STEM = re.compile(r"^(iteration-\d{6})(?:\..+)?$")
@@ -76,7 +78,7 @@ def build_resume_prompt(
 def write_iteration_metadata(
     *,
     log_path: Path,
-    provider_name: str,
+    execution: ProviderExecution,
     working_dir: Path,
     log_dir: Path,
     base_prompt_path: Path,
@@ -88,12 +90,18 @@ def write_iteration_metadata(
     iteration_cost: Decimal,
     failure_message: str | None,
     stop_reason: str | None,
+    failover_target_provider: str | None,
     resume_context: ResumeContext | None,
     resume_note: str | None,
 ) -> None:
     payload = {
         "version": 1,
-        "provider_name": provider_name,
+        "provider_name": execution.name,
+        "provider_binary": execution.binary,
+        "provider_model": execution.model,
+        "provider_max_turns": execution.max_turns,
+        "provider_use_bare": execution.use_bare,
+        "provider_safe_mode": execution.safe_mode,
         "working_dir": str(working_dir),
         "log_dir": str(log_dir),
         "log_path": str(log_path),
@@ -106,6 +114,7 @@ def write_iteration_metadata(
         "iteration_cost_usd": _decimal_to_string(iteration_cost),
         "failure_message": failure_message,
         "stop_reason": stop_reason,
+        "failover_target_provider": failover_target_provider,
         "resume_source_log_path": str(resume_context.source_log_path) if resume_context else None,
         "resume_source_metadata_path": (
             str(resume_context.source_metadata_path)

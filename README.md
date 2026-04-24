@@ -10,6 +10,8 @@ This is a Python rewrite of the `ralph.sh` loop runner. The first version keeps 
 - Graceful shutdown with first `Ctrl+C` waiting for the current run and second `Ctrl+C` force-terminating it
 - Claude provider adapter with command building, error classification, and cost extraction
 - Codex provider adapter with `codex exec` support and provider-specific validation
+- Automatic in-process failover across multiple providers on eligible failures such as rate limits
+- Provider-specific settings loaded from `ralph-providers.toml`
 - Resume handoff support so a new run can pick up from a prior iteration log, including cross-provider handoff
 - Per-iteration metadata artifacts for future resume/failover runs
 - Small stdlib test suite
@@ -20,6 +22,7 @@ This is a Python rewrite of the `ralph.sh` loop runner. The first version keeps 
 python3 -m ralph --help
 python3 -m ralph --provider claude -f ./PROMPT.md
 python3 -m ralph --provider codex -f ./PROMPT.md
+python3 -m ralph --provider claude --provider codex -f ./PROMPT.md
 python3 -m ralph --provider codex -f ./PROMPT.md --iteration-timeout 20 --check "pytest -q"
 python3 -m ralph -f ./PROMPT.md --stop-on-regex "DONE" --stop-when-file ./DONE.flag
 python3 -m ralph --provider codex -f ./PROMPT.md --resume-from ./ralph-logs --resume-note "Claude hit a usage limit; continue from the in-progress work."
@@ -32,12 +35,38 @@ pip install -e .
 ralph --provider claude -f ./PROMPT.md
 ```
 
+## Provider Config
+
+Create `./ralph-providers.toml` to define provider-specific settings once:
+
+```toml
+[providers.claude]
+model = "opus-4.7"
+safe = true
+
+[providers.codex]
+model = "gpt-5.4"
+bare = true
+```
+
+Ralph automatically loads that file when it exists. You can also point at another file with `--provider-config`.
+
+When you run:
+
+```bash
+python3 -m ralph --provider claude --provider codex -f ./PROMPT.md
+```
+
+Ralph starts with Claude using the Claude profile and, if it hits an auto-failover condition such as a rate limit, switches to Codex in the same process using the Codex profile.
+
 ## Notes
 
 - `codex` currently supports `stream-json` only; `--no-stream` is rejected for that provider.
 - `codex` does not expose explicit cost data in the local JSON stream today, so cost tracking remains `0` unless the CLI starts emitting cost fields.
+- Repeat `--provider` to define failover order. Ralph keeps using the current provider until it hits an eligible failover condition or you stop the loop.
 - `--check` commands are run with the current shell and stop the loop when all configured checks pass.
 - `--stop-on-clean-git` ignores the configured log directory so Ralph's own log files do not keep the repo dirty.
 - `--resume-from` accepts either an `iteration-*.json` log or a Ralph log directory. Ralph resolves that to a prior iteration, writes per-iteration `.meta.json` artifacts, and appends a generated handoff block to each resumed prompt.
+- Auto-failover reuses the same handoff mechanism internally: the failed iteration becomes the resume source for the next provider in the configured order.
 - The core loop no longer depends on `jq`, `bc`, or `setsid`.
 - Adding another provider should mostly be a matter of implementing another adapter in `ralph/providers/`.

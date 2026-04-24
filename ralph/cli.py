@@ -27,13 +27,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--provider",
+        action="append",
+        dest="provider_names",
         choices=sorted(PROVIDERS),
-        default="claude",
-        help="Provider adapter to use.",
+        help="Provider adapter to use. Repeat to define automatic failover order.",
+    )
+    parser.add_argument(
+        "--provider-config",
+        help=(
+            "TOML file with per-provider settings. Defaults to ./ralph-providers.toml "
+            "when that file exists."
+        ),
     )
     parser.add_argument(
         "--provider-binary",
-        help="Override the executable name or path for the selected provider.",
+        help="Default executable name or path for providers without a profile-specific binary.",
     )
     parser.add_argument(
         "-f",
@@ -83,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-m",
         "--model",
-        help="Model name to pass to the provider.",
+        help="Default model name for providers without a profile-specific model.",
     )
     parser.add_argument(
         "-w",
@@ -104,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-turns",
         type=parse_positive_int,
-        help="Max agentic turns per iteration.",
+        help="Default max agentic turns for providers without a profile-specific setting.",
     )
     parser.add_argument(
         "--log-dir",
@@ -154,12 +162,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bare",
         action="store_true",
-        help="Use the provider's bare/minimal mode when supported.",
+        default=None,
+        help="Default bare/minimal mode for providers without a profile-specific setting.",
     )
     parser.add_argument(
         "--safe",
         action="store_true",
-        help="Use the provider's non-bypass/sandboxed mode when supported.",
+        default=None,
+        help="Default non-bypass/sandboxed mode for providers without a profile-specific setting.",
     )
     parser.add_argument(
         "--resume-from",
@@ -187,7 +197,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         config = build_config(args)
-        provider = PROVIDERS[config.provider_name]
-        return run_loop(config, provider)
+        return run_loop(config, PROVIDERS)
     except (FileNotFoundError, ValueError) as exc:
         parser.exit(status=1, message=f"ERROR: {exc}\n")

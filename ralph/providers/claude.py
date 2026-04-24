@@ -4,8 +4,8 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-from ..config import OutputFormat, RunnerConfig
-from .base import FailureDecision
+from ..config import OutputFormat, ProviderExecution, RunnerConfig
+from .base import FailureDecision, FailureKind
 from .utils import decimal_from_value, iter_jsonl, read_log_text
 
 
@@ -13,15 +13,19 @@ class ClaudeProvider:
     name = "claude"
     default_binary = "claude"
 
-    def executable_name(self, config: RunnerConfig) -> str:
-        return config.provider_binary or self.default_binary
+    def executable_name(self, execution: ProviderExecution) -> str:
+        return execution.binary or self.default_binary
 
-    def validate_config(self, config: RunnerConfig) -> None:
-        del config
+    def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
+        del config, execution
 
-    def build_command(self, config: RunnerConfig) -> list[str]:
+    def build_command(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> list[str]:
         command = [
-            self.executable_name(config),
+            self.executable_name(execution),
             "-p",
             "--output-format",
             config.output_format.value,
@@ -30,17 +34,17 @@ class ClaudeProvider:
         if config.output_format is OutputFormat.STREAM_JSON:
             command.append("--verbose")
 
-        if not config.safe_mode:
+        if not execution.safe_mode:
             command.append("--dangerously-skip-permissions")
 
-        if config.use_bare:
+        if execution.use_bare:
             command.append("--bare")
 
-        if config.model:
-            command.extend(["--model", config.model])
+        if execution.model:
+            command.extend(["--model", execution.model])
 
-        if config.max_turns is not None:
-            command.extend(["--max-turns", str(config.max_turns)])
+        if execution.max_turns is not None:
+            command.extend(["--max-turns", str(execution.max_turns)])
 
         return command
 
@@ -67,10 +71,14 @@ class ClaudeProvider:
         exit_code: int,
         log_path: Path,
         config: RunnerConfig,
+        execution: ProviderExecution,
     ) -> FailureDecision:
+        del execution
         if exit_code == 2:
             return FailureDecision(
+                kind=FailureKind.AUTH,
                 fatal=True,
+                should_failover=True,
                 message=(
                     "FATAL: Authentication error (exit code 2). "
                     "Run 'claude auth login' or check ANTHROPIC_API_KEY."
@@ -82,6 +90,7 @@ class ClaudeProvider:
         if exit_code == 1:
             if any(pattern in log_text for pattern in ("rate.limit", "usage.limit", "rate_limit")):
                 return FailureDecision(
+                    kind=FailureKind.RATE_LIMIT,
                     message=(
                         "RATE LIMITED detected in output. "
                         f"Waiting {config.wait_on_limit_mins} minutes before retrying..."
@@ -89,10 +98,12 @@ class ClaudeProvider:
                     wait_seconds=config.wait_on_limit_mins * 60,
                     reset_error_count=True,
                     skip_pause=True,
+                    should_failover=True,
                 )
 
             if any(pattern in log_text for pattern in ("overloaded", "529", "temporarily unavailable")):
                 return FailureDecision(
+                    kind=FailureKind.OVERLOADED,
                     message="API overloaded (529). Waiting 2 minutes before retrying...",
                     wait_seconds=120,
                     skip_pause=True,

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from ..config import OutputFormat, RunnerConfig
-from .base import FailureDecision
+from ..config import OutputFormat, ProviderExecution, RunnerConfig
+from .base import FailureDecision, FailureKind
 from .utils import decimal_from_value, iter_jsonl, read_log_text
 
 
@@ -11,18 +11,22 @@ class CodexProvider:
     name = "codex"
     default_binary = "codex"
 
-    def executable_name(self, config: RunnerConfig) -> str:
-        return config.provider_binary or self.default_binary
+    def executable_name(self, execution: ProviderExecution) -> str:
+        return execution.binary or self.default_binary
 
-    def validate_config(self, config: RunnerConfig) -> None:
+    def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
         if config.output_format is not OutputFormat.STREAM_JSON:
             raise ValueError("Provider 'codex' only supports stream-json output.")
-        if config.max_turns is not None:
+        if execution.max_turns is not None:
             raise ValueError("Provider 'codex' does not support --max-turns.")
 
-    def build_command(self, config: RunnerConfig) -> list[str]:
+    def build_command(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> list[str]:
         command = [
-            self.executable_name(config),
+            self.executable_name(execution),
             "exec",
             "--json",
             "--skip-git-repo-check",
@@ -30,16 +34,16 @@ class CodexProvider:
             str(config.working_dir),
         ]
 
-        if config.safe_mode:
+        if execution.safe_mode:
             command.append("--full-auto")
         else:
             command.append("--dangerously-bypass-approvals-and-sandbox")
 
-        if config.use_bare:
+        if execution.use_bare:
             command.extend(["--ignore-user-config", "--ignore-rules"])
 
-        if config.model:
-            command.extend(["-m", config.model])
+        if execution.model:
+            command.extend(["-m", execution.model])
 
         return command
 
@@ -66,12 +70,16 @@ class CodexProvider:
         exit_code: int,
         log_path: Path,
         config: RunnerConfig,
+        execution: ProviderExecution,
     ) -> FailureDecision:
+        del execution
         log_text = read_log_text(log_path, lower=True)
 
         if any(pattern in log_text for pattern in _AUTH_PATTERNS):
             return FailureDecision(
+                kind=FailureKind.AUTH,
                 fatal=True,
+                should_failover=True,
                 message=(
                     "FATAL: Authentication error. Run 'codex login' and verify the account "
                     f"can access the requested model. Check {log_path} for details."
@@ -80,6 +88,7 @@ class CodexProvider:
 
         if any(pattern in log_text for pattern in _RATE_LIMIT_PATTERNS):
             return FailureDecision(
+                kind=FailureKind.RATE_LIMIT,
                 message=(
                     "RATE LIMITED detected in output. "
                     f"Waiting {config.wait_on_limit_mins} minutes before retrying..."
@@ -87,10 +96,12 @@ class CodexProvider:
                 wait_seconds=config.wait_on_limit_mins * 60,
                 reset_error_count=True,
                 skip_pause=True,
+                should_failover=True,
             )
 
         if any(pattern in log_text for pattern in _OVERLOAD_PATTERNS):
             return FailureDecision(
+                kind=FailureKind.OVERLOADED,
                 message="Codex service overload detected. Waiting 2 minutes before retrying...",
                 wait_seconds=120,
                 skip_pause=True,
@@ -98,7 +109,9 @@ class CodexProvider:
 
         if exit_code == 2:
             return FailureDecision(
+                kind=FailureKind.INVALID_REQUEST,
                 fatal=True,
+                should_failover=True,
                 message=(
                     "FATAL: Codex CLI usage/configuration error (exit code 2). "
                     f"Check {log_path} for details."
@@ -107,7 +120,9 @@ class CodexProvider:
 
         if any(pattern in log_text for pattern in _INVALID_REQUEST_PATTERNS):
             return FailureDecision(
+                kind=FailureKind.INVALID_REQUEST,
                 fatal=True,
+                should_failover=True,
                 message=(
                     "FATAL: Codex rejected the request. Check the selected model and provider "
                     f"options. See {log_path} for details."
