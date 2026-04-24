@@ -162,6 +162,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the provider's non-bypass/sandboxed mode when supported.",
     )
     parser.add_argument(
+        "--resume-from",
+        help=(
+            "Previous iteration log or Ralph log directory to resume from. "
+            "Ralph appends a generated handoff block to each prompt so a new provider "
+            "can pick up interrupted work."
+        ),
+    )
+    parser.add_argument(
+        "--resume-note",
+        help="Additional operator note to include in the generated resume handoff block.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show config and exit.",

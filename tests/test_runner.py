@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shlex
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ralph.config import OutputFormat, PromptSpec, RunnerConfig
+from ralph.handoff import metadata_path_for, prompt_artifact_path_for
 from ralph.providers.base import FailureDecision
 from ralph.runner import run_loop
 
@@ -113,6 +115,75 @@ class RunnerTests(unittest.TestCase):
             log_text = (config.log_dir / "ralph.log").read_text(encoding="utf-8")
             self.assertIn("Git worktree is clean", log_text)
 
+    def test_resume_from_directory_uses_latest_iteration_log(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            previous_logs = temp_root / "previous-logs"
+            previous_logs.mkdir()
+            older_log = previous_logs / "iteration-000003.json"
+            latest_log = previous_logs / "iteration-000014.json"
+            older_log.write_text("older", encoding="utf-8")
+            latest_log.write_text("latest", encoding="utf-8")
+            metadata_path_for(latest_log).write_text(
+                json.dumps(
+                    {
+                        "provider_name": "claude",
+                        "base_prompt_path": str(temp_root / "OLD_PROMPT.md"),
+                        "exit_code": 1,
+                        "timed_out": False,
+                        "failure_message": "RATE LIMITED detected in output.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = _make_config(
+                temp_root,
+                max_iterations=1,
+                resume_from=previous_logs,
+                resume_note="Switch providers and continue from the partial work.",
+            )
+            provider = FakeProvider([sys.executable, "-c", "import sys; print(sys.stdin.read())"])
+
+            exit_code = run_loop(config, provider)
+
+            self.assertEqual(exit_code, 0)
+            current_log = config.log_dir / "iteration-000001.json"
+            prompt_artifact = prompt_artifact_path_for(current_log)
+            log_text = current_log.read_text(encoding="utf-8")
+            self.assertTrue(prompt_artifact.is_file())
+            self.assertIn("=== RALPH RESUME CONTEXT ===", log_text)
+            self.assertIn(f"Previous raw log: {latest_log}", log_text)
+            self.assertIn("Previous provider: claude", log_text)
+            self.assertIn("Previous exit code: 1", log_text)
+            self.assertIn(
+                "Operator note: Switch providers and continue from the partial work.",
+                log_text,
+            )
+
+    def test_failure_iteration_writes_metadata_for_future_resume(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(temp_root, max_consecutive_errors=1, max_iterations=1)
+            provider = FakeProvider(
+                [sys.executable, "-c", "import sys; print('boom'); sys.exit(1)"],
+            )
+
+            exit_code = run_loop(config, provider)
+
+            self.assertEqual(exit_code, 1)
+            metadata = json.loads(
+                metadata_path_for(config.log_dir / "iteration-000001.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(metadata["provider_name"], "fake")
+            self.assertEqual(metadata["exit_code"], 1)
+            self.assertFalse(metadata["success"])
+            self.assertEqual(metadata["failure_message"], "process failed with exit code 1")
+            self.assertEqual(metadata["resume_source_log_path"], None)
+            self.assertIn("git_status", metadata)
+
 
 class FakeProvider:
     name = "fake"
@@ -148,12 +219,15 @@ class FakeProvider:
 def _make_config(
     temp_root: Path,
     *,
+    max_iterations: int = 0,
     iteration_timeout_minutes: Decimal = Decimal("0"),
     check_commands: tuple[str, ...] = (),
     stop_on_regexes: tuple[str, ...] = (),
     stop_on_clean_git: bool = False,
     stop_when_files: tuple[Path, ...] = (),
     max_consecutive_errors: int = 5,
+    resume_from: Path | None = None,
+    resume_note: str | None = None,
 ) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
@@ -163,7 +237,7 @@ def _make_config(
         provider_binary=None,
         prompt_specs=(PromptSpec(path=prompt_path, repeat=1),),
         prompt_sequence=(prompt_path,),
-        max_iterations=0,
+        max_iterations=max_iterations,
         max_cost=Decimal("0"),
         max_duration_hours=Decimal("0"),
         iteration_timeout_minutes=iteration_timeout_minutes,
@@ -181,6 +255,8 @@ def _make_config(
         output_format=OutputFormat.STREAM_JSON,
         use_bare=False,
         safe_mode=False,
+        resume_from=resume_from,
+        resume_note=resume_note,
         dry_run=False,
     )
 

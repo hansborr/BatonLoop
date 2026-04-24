@@ -44,6 +44,8 @@ class RunnerConfig:
     output_format: OutputFormat
     use_bare: bool
     safe_mode: bool
+    resume_from: Path | None
+    resume_note: str | None
     dry_run: bool
 
 
@@ -137,6 +139,11 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         resolve_path(Path(raw_path).expanduser(), working_dir)
         for raw_path in (args.stop_when_files or [])
     )
+    resume_from = (
+        resolve_path(Path(args.resume_from).expanduser(), working_dir)
+        if args.resume_from
+        else None
+    )
 
     output_format = (
         OutputFormat.JSON if args.no_stream else OutputFormat(args.output_format)
@@ -166,6 +173,8 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         output_format=output_format,
         use_bare=args.bare,
         safe_mode=args.safe,
+        resume_from=resume_from,
+        resume_note=args.resume_note or None,
         dry_run=args.dry_run,
     )
 

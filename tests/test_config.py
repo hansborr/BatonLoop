@@ -52,6 +52,8 @@ class PromptSpecTests(unittest.TestCase):
                     no_stream=False,
                     bare=False,
                     safe=False,
+                    resume_from=str(temp_root / "old-logs"),
+                    resume_note="resume after usage limit",
                     dry_run=False,
                 )
             )
@@ -65,6 +67,8 @@ class PromptSpecTests(unittest.TestCase):
             self.assertEqual(config.check_commands, ("pytest -q",))
             self.assertEqual(config.stop_on_regexes, ("DONE",))
             self.assertEqual(config.stop_when_files, (temp_root / "done.flag",))
+            self.assertEqual(config.resume_from, temp_root / "old-logs")
+            self.assertEqual(config.resume_note, "resume after usage limit")
 
 
 if __name__ == "__main__":

@@ -139,6 +139,8 @@ def _make_config(
         output_format=output_format,
         use_bare=use_bare,
         safe_mode=safe_mode,
+        resume_from=None,
+        resume_note=None,
         dry_run=False,
     )
 

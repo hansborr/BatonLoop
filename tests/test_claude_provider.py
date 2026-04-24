@@ -96,6 +96,8 @@ def _make_config(temp_root: Path) -> RunnerConfig:
         output_format=OutputFormat.STREAM_JSON,
         use_bare=False,
         safe_mode=False,
+        resume_from=None,
+        resume_note=None,
         dry_run=False,
     )
 

@@ -13,6 +13,13 @@ from shutil import which
 from types import FrameType
 
 from .config import RunnerConfig
+from .handoff import (
+    ResumeContext,
+    build_resume_prompt,
+    prompt_artifact_path_for,
+    resolve_resume_context,
+    write_iteration_metadata,
+)
 from .providers.base import Provider
 from .providers.utils import read_log_text
 
@@ -90,6 +97,9 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
     _validate_runtime_config(config)
     _ensure_executable_available(provider.executable_name(config))
     config.log_dir.mkdir(parents=True, exist_ok=True)
+    resume_context = (
+        resolve_resume_context(config.resume_from) if config.resume_from is not None else None
+    )
 
     logger = _configure_logger(config.log_dir / "ralph.log")
     controller = StopController(logger)
@@ -137,18 +147,38 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
                 )
 
             iteration_log = config.log_dir / f"iteration-{state.iteration:06d}.json"
+            prompt_input_path = _prepare_iteration_prompt(
+                config=config,
+                provider=provider,
+                base_prompt_path=current_prompt,
+                log_path=iteration_log,
+                resume_context=resume_context,
+            )
             iteration_result = _run_iteration(
                 provider=provider,
                 config=config,
-                prompt_path=current_prompt,
+                prompt_path=prompt_input_path,
                 log_path=iteration_log,
                 controller=controller,
             )
             exit_code = iteration_result.exit_code
             logger.info("Exit code: %s", exit_code)
+            iteration_cost = Decimal("0")
+            failure_message = None
+            stop_reason = None
+            success = False
+            wait_seconds = 0
+            reset_error_count = False
+            skip_pause_after_wait = False
+            should_break = False
 
             if iteration_result.timed_out:
                 state.consecutive_errors += 1
+                failure_message = (
+                    "Iteration "
+                    f"{state.iteration} timed out after "
+                    f"{_format_minutes_limit(config.iteration_timeout_minutes)} and was terminated."
+                )
                 logger.warning(
                     "Iteration %s timed out after %s and was terminated.",
                     state.iteration,
@@ -156,19 +186,14 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
                 )
 
                 if state.consecutive_errors >= config.max_consecutive_errors:
-                    logger.error(
-                        "FATAL: %s consecutive errors. Stopping.",
-                        config.max_consecutive_errors,
+                    stop_reason = (
+                        f"FATAL: {config.max_consecutive_errors} consecutive errors. Stopping."
                     )
+                    logger.error(stop_reason)
                     exit_status = 1
-                    break
-
-                logger.info(
-                    "Consecutive errors: %s/%s. Retrying after pause...",
-                    state.consecutive_errors,
-                    config.max_consecutive_errors,
-                )
+                    should_break = True
             elif exit_code == 0:
+                success = True
                 state.consecutive_errors = 0
                 state.completed_iterations += 1
                 logger.info("Iteration %s completed successfully.", state.iteration)
@@ -189,44 +214,77 @@ def run_loop(config: RunnerConfig, provider: Provider) -> int:
                     iteration=state.iteration,
                     iteration_log=iteration_log,
                 )
-                _rotate_logs(config.log_dir, config.log_retain)
 
                 if stop_reason:
                     logger.info(stop_reason)
-                    break
-
-                if config.max_cost and state.total_cost >= config.max_cost:
+                    should_break = True
+                elif config.max_cost and state.total_cost >= config.max_cost:
+                    stop_reason = (
+                        "STOP: Cost limit reached "
+                        f"(${_format_decimal(state.total_cost)} >= ${_format_decimal(config.max_cost)})"
+                    )
                     logger.info(
                         "STOP: Cost limit reached ($%s >= $%s)",
                         _format_decimal(state.total_cost),
                         _format_decimal(config.max_cost),
                     )
-                    break
+                    should_break = True
             else:
                 decision = provider.classify_failure(exit_code, iteration_log, config)
+                failure_message = decision.message
                 if decision.fatal:
                     logger.error(decision.message)
                     exit_status = 1
-                    break
+                    stop_reason = decision.message
+                    should_break = True
+                else:
+                    state.consecutive_errors += 1
+                    logger.warning(decision.message)
 
-                state.consecutive_errors += 1
-                logger.warning(decision.message)
+                    if state.consecutive_errors >= config.max_consecutive_errors:
+                        stop_reason = (
+                            f"FATAL: {config.max_consecutive_errors} consecutive errors. Stopping."
+                        )
+                        logger.error(stop_reason)
+                        exit_status = 1
+                        should_break = True
+                    else:
+                        wait_seconds = decision.wait_seconds
+                        reset_error_count = decision.reset_error_count
+                        skip_pause_after_wait = decision.skip_pause
 
-                if state.consecutive_errors >= config.max_consecutive_errors:
-                    logger.error(
-                        "FATAL: %s consecutive errors. Stopping.",
-                        config.max_consecutive_errors,
-                    )
-                    exit_status = 1
-                    break
+            write_iteration_metadata(
+                log_path=iteration_log,
+                provider_name=provider.name,
+                working_dir=config.working_dir,
+                log_dir=config.log_dir,
+                base_prompt_path=current_prompt,
+                input_prompt_path=prompt_input_path,
+                output_format=config.output_format.value,
+                exit_code=exit_code,
+                timed_out=iteration_result.timed_out,
+                success=success,
+                iteration_cost=iteration_cost,
+                failure_message=failure_message,
+                stop_reason=stop_reason,
+                resume_context=resume_context,
+                resume_note=config.resume_note,
+            )
 
-                if decision.wait_seconds > 0:
-                    _interruptible_sleep(decision.wait_seconds, controller)
-                    if decision.reset_error_count:
-                        state.consecutive_errors = 0
-                    if decision.skip_pause:
-                        continue
+            if success:
+                _rotate_logs(config.log_dir, config.log_retain)
 
+            if should_break:
+                break
+
+            if wait_seconds > 0:
+                _interruptible_sleep(wait_seconds, controller)
+                if reset_error_count:
+                    state.consecutive_errors = 0
+                if skip_pause_after_wait:
+                    continue
+
+            if not success:
                 logger.info(
                     "Consecutive errors: %s/%s. Retrying after pause...",
                     state.consecutive_errors,
@@ -325,6 +383,8 @@ def _log_startup(logger: logging.Logger, config: RunnerConfig, provider: Provide
     logger.info("Output format:   %s", config.output_format.value)
     logger.info("Bare mode:       %s", config.use_bare)
     logger.info("Safe mode:       %s", config.safe_mode)
+    logger.info("Resume from:     %s", config.resume_from if config.resume_from else "none")
+    logger.info("Resume note:     %s", config.resume_note or "none")
     logger.info("Log directory:   %s", config.log_dir)
     logger.info("Log retain:      %s", _format_limit(config.log_retain))
     logger.info(
@@ -396,6 +456,30 @@ def _run_iteration(
         stdin_path=prompt_path,
         timeout_seconds=_timeout_seconds(config),
     )
+
+
+def _prepare_iteration_prompt(
+    *,
+    config: RunnerConfig,
+    provider: Provider,
+    base_prompt_path: Path,
+    log_path: Path,
+    resume_context: ResumeContext | None,
+) -> Path:
+    if resume_context is None:
+        return base_prompt_path
+
+    prompt_text = build_resume_prompt(
+        base_prompt_path=base_prompt_path,
+        current_provider_name=provider.name,
+        working_dir=config.working_dir,
+        log_dir=config.log_dir,
+        resume_context=resume_context,
+        resume_note=config.resume_note,
+    )
+    prompt_artifact_path = prompt_artifact_path_for(log_path)
+    prompt_artifact_path.write_text(prompt_text, encoding="utf-8")
+    return prompt_artifact_path
 
 
 def _interruptible_sleep(seconds: int, controller: StopController) -> None:
