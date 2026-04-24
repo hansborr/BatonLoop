@@ -14,11 +14,12 @@ from .config import (
     resolve_path,
 )
 from .handoff import resolve_resume_context
-from .providers import ClaudeProvider, CodexProvider
+from .providers import ClaudeProvider, CopilotProvider, CodexProvider
 from .runner import run_loop
 
 PROVIDERS = {
     "claude": ClaudeProvider(),
+    "copilot": CopilotProvider(),
     "codex": CodexProvider(),
 }
 
