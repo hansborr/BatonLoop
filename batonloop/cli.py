@@ -8,6 +8,8 @@ from pathlib import Path
 from .config import (
     OutputFormat,
     build_config,
+    parse_decimal_at_least_one,
+    parse_fraction,
     parse_non_negative_decimal,
     parse_non_negative_int,
     parse_positive_int,
@@ -30,6 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run AI coding agents in a loop.",
     )
 
+    parser.add_argument(
+        "--config",
+        help=(
+            "TOML file with run settings. Defaults to ./batonloop.toml when that file exists."
+        ),
+    )
     parser.add_argument(
         "--provider",
         action="append",
@@ -60,14 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--iterations",
         dest="max_iterations",
         type=parse_non_negative_int,
-        default=0,
+        default=None,
         help="Max provider-run attempts, including failed iterations. Use 0 for unlimited.",
     )
     parser.add_argument(
         "-c",
         "--max-cost",
         type=parse_non_negative_decimal,
-        default=parse_non_negative_decimal("0"),
+        default=None,
         help="Max cumulative cost in USD. Use 0 for unlimited.",
     )
     parser.add_argument(
@@ -75,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--duration",
         dest="max_duration_hours",
         type=parse_non_negative_decimal,
-        default=parse_non_negative_decimal("0"),
+        default=None,
         help="Max duration in hours. Use 0 for unlimited.",
     )
     parser.add_argument(
@@ -83,14 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--pause",
         dest="pause_seconds",
         type=parse_non_negative_int,
-        default=5,
+        default=None,
         help="Pause between iterations in seconds.",
     )
     parser.add_argument(
         "--iteration-timeout",
         dest="iteration_timeout_minutes",
         type=parse_non_negative_decimal,
-        default=parse_non_negative_decimal("0"),
+        default=None,
         help="Timeout in minutes for each provider run and post-iteration check. Use 0 for unlimited.",
     )
     parser.add_argument(
@@ -103,15 +111,55 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-on-limit",
         dest="wait_on_limit_mins",
         type=parse_non_negative_int,
-        default=30,
+        default=None,
         help="Minutes to wait after a detected rate limit.",
+    )
+    parser.add_argument(
+        "--retry-backoff-base",
+        dest="retry_backoff_base_seconds",
+        type=parse_non_negative_int,
+        default=None,
+        help=(
+            "Initial retry backoff in seconds for nonfatal provider failures. "
+            "Use 0 to disable exponential retry backoff."
+        ),
+    )
+    parser.add_argument(
+        "--retry-backoff-multiplier",
+        type=parse_decimal_at_least_one,
+        default=None,
+        help="Multiplier applied to retry backoff after each consecutive nonfatal error.",
+    )
+    parser.add_argument(
+        "--retry-backoff-max",
+        dest="retry_backoff_max_seconds",
+        type=parse_non_negative_int,
+        default=None,
+        help="Maximum retry backoff in seconds. Use 0 for no cap.",
+    )
+    parser.add_argument(
+        "--retry-jitter",
+        dest="retry_jitter_fraction",
+        type=parse_fraction,
+        default=None,
+        help="Random retry jitter as a fraction from 0 to 1, for example 0.2 for +/-20%%.",
+    )
+    parser.add_argument(
+        "--provider-cooldown",
+        dest="provider_cooldown_seconds",
+        type=parse_non_negative_int,
+        default=None,
+        help=(
+            "Seconds to keep a provider out of failover rotation after a failover-eligible "
+            "failure. Use 0 to disable provider cooldowns."
+        ),
     )
     parser.add_argument(
         "-e",
         "--max-errors",
         dest="max_consecutive_errors",
         type=parse_positive_int,
-        default=5,
+        default=None,
         help="Max consecutive errors before stopping.",
     )
     parser.add_argument(
@@ -121,13 +169,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-dir",
-        default="./batonloop-logs",
+        default=None,
         help="Directory for logs.",
     )
     parser.add_argument(
         "--log-retain",
         type=parse_non_negative_int,
-        default=0,
+        default=None,
         help="Keep only the last N iteration logs. Use 0 to keep all.",
     )
     parser.add_argument(
@@ -145,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stop-on-clean-git",
         action="store_true",
+        default=None,
         help="Stop when the current Git worktree is clean after a successful iteration.",
     )
     parser.add_argument(
@@ -156,29 +205,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-format",
         choices=[format_.value for format_ in OutputFormat],
-        default=OutputFormat.STREAM_JSON.value,
+        default=None,
         help="Provider output format.",
     )
     parser.add_argument(
         "--no-stream",
         action="store_true",
+        default=None,
         help="Shortcut for --output-format json.",
     )
     parser.add_argument(
         "--live-output",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Show filtered live provider progress in the console and BatonLoop log.",
     )
     parser.add_argument(
         "--bare",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
         help="Default bare/minimal mode for providers without a profile-specific setting.",
     )
     parser.add_argument(
         "--safe",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
         help="Default non-bypass/sandboxed mode for providers without a profile-specific setting.",
     )
@@ -197,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
+        default=None,
         help="Show config and exit.",
     )
     subparsers = parser.add_subparsers(dest="command")

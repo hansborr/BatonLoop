@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import signal
 import subprocess
@@ -23,7 +24,7 @@ from .handoff import (
     write_iteration_metadata,
 )
 from .live_output import LiveOutputConsumer
-from .providers.base import Provider
+from .providers.base import FailureDecision, Provider
 from .providers.utils import read_log_text
 
 
@@ -34,6 +35,7 @@ class RunState:
     completed_iterations: int = 0
     total_cost: Decimal = field(default_factory=lambda: Decimal("0"))
     consecutive_errors: int = 0
+    provider_cooldowns: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -253,6 +255,8 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 current_provider_index = outcome.next_provider_index
                 state.consecutive_errors = 0
                 resume_context = resolve_resume_context(iteration.log_path)
+                if outcome.wait_seconds > 0:
+                    _interruptible_sleep(outcome.wait_seconds, controller)
                 continue
 
             if outcome.should_break:
@@ -362,6 +366,10 @@ def _log_startup(
 ) -> None:
     logger.info("=== BatonLoop Starting ===")
     logger.info(
+        "Run config:      %s",
+        config.run_config_path if config.run_config_path else "none",
+    )
+    logger.info(
         "Providers:       %s",
         " -> ".join(slot.execution.name for slot in provider_slots),
     )
@@ -396,6 +404,14 @@ def _log_startup(
     logger.info("Iter timeout:    %s", _format_minutes_limit(config.iteration_timeout_minutes))
     logger.info("Pause between:   %ss", config.pause_seconds)
     logger.info("Rate limit wait: %sm", config.wait_on_limit_mins)
+    logger.info(
+        "Retry backoff:   base=%ss multiplier=%s max=%s jitter=%s",
+        config.retry_backoff_base_seconds,
+        _format_decimal(config.retry_backoff_multiplier),
+        _format_limit(config.retry_backoff_max_seconds),
+        _format_decimal(config.retry_jitter_fraction),
+    )
+    logger.info("Provider cooldown: %ss", config.provider_cooldown_seconds)
     logger.info("Max errors:      %s", config.max_consecutive_errors)
     logger.info("Output format:   %s", config.output_format.value)
     logger.info("Live output:     %s", config.live_output)
@@ -596,27 +612,63 @@ def _handle_iteration_outcome(
             config,
             iteration.slot.execution,
         )
-        candidate_provider_index = current_provider_index + 1
+        now = time.monotonic()
         has_remaining_attempt_budget = (
             config.max_iterations == 0
             or state.attempted_iterations < config.max_iterations
         )
-        can_failover = (
-            decision.should_failover
-            and candidate_provider_index < len(provider_slots)
-            and has_remaining_attempt_budget
+        if decision.should_failover and has_remaining_attempt_budget:
+            _cool_down_provider(
+                state=state,
+                provider_name=iteration.slot.execution.name,
+                now=now,
+                cooldown_seconds=config.provider_cooldown_seconds,
+            )
+        failover_target = (
+            _select_failover_target(
+                provider_slots=provider_slots,
+                current_provider_index=current_provider_index,
+                cooldowns=state.provider_cooldowns,
+                now=now,
+                allow_wrap=config.provider_cooldown_seconds > 0,
+            )
+            if decision.should_failover and has_remaining_attempt_budget
+            else None
         )
+        can_failover = failover_target is not None
 
         if can_failover:
             failure_message = decision.message
-            failover_target_provider = provider_slots[candidate_provider_index].execution.name
+            target_provider_index, cooldown_wait_seconds = failover_target
+            failover_target_provider = provider_slots[target_provider_index].execution.name
+            logger.warning(decision.message)
+            if cooldown_wait_seconds > 0:
+                logger.info(
+                    "AUTO FAILOVER: Waiting %ss for provider cooldown before switching "
+                    "from %s to %s.",
+                    cooldown_wait_seconds,
+                    iteration.slot.execution.name,
+                    failover_target_provider,
+                )
+                wait_seconds = cooldown_wait_seconds
+                skip_pause_after_wait = True
+            else:
+                logger.info(
+                    "AUTO FAILOVER: Switching provider from %s to %s.",
+                    iteration.slot.execution.name,
+                    failover_target_provider,
+                )
+            next_provider_index = target_provider_index
+        elif decision.should_failover and has_remaining_attempt_budget:
+            failure_message = decision.message
             logger.warning(decision.message)
             logger.info(
-                "AUTO FAILOVER: Switching provider from %s to %s.",
-                iteration.slot.execution.name,
-                failover_target_provider,
+                "No alternate provider is configured for failover; retrying current provider."
             )
-            next_provider_index = candidate_provider_index
+            state.consecutive_errors += 1
+            wait_seconds = _retry_wait_seconds(config, state, decision)
+            reset_error_count = decision.reset_error_count
+            skip_pause_after_wait = decision.skip_pause or wait_seconds > 0
         elif decision.fatal:
             failure_message = decision.message
             logger.error(decision.message)
@@ -635,14 +687,15 @@ def _handle_iteration_outcome(
             elif has_remaining_attempt_budget:
                 failure_message = decision.message
                 logger.warning(failure_message)
-                wait_seconds = decision.wait_seconds
+                wait_seconds = _retry_wait_seconds(config, state, decision)
                 reset_error_count = decision.reset_error_count
-                skip_pause_after_wait = decision.skip_pause
+                skip_pause_after_wait = decision.skip_pause or wait_seconds > 0
             else:
                 failure_message = (
                     f"{decision.message} Iteration limit reached before another retry."
                 )
                 logger.warning(failure_message)
+                exit_status = 1
 
     if (
         not should_break
@@ -667,6 +720,89 @@ def _handle_iteration_outcome(
         failover_target_provider=failover_target_provider,
         next_provider_index=next_provider_index,
     )
+
+
+def _retry_wait_seconds(
+    config: RunnerConfig,
+    state: RunState,
+    decision: FailureDecision,
+) -> int:
+    wait_seconds = max(0, decision.wait_seconds)
+    backoff_seconds = _retry_backoff_seconds(config, state.consecutive_errors)
+    wait_seconds = max(wait_seconds, backoff_seconds)
+    return _apply_retry_jitter(wait_seconds, config.retry_jitter_fraction)
+
+
+def _retry_backoff_seconds(config: RunnerConfig, consecutive_errors: int) -> int:
+    if config.retry_backoff_base_seconds == 0 or consecutive_errors <= 0:
+        return 0
+
+    exponent = max(0, consecutive_errors - 1)
+    wait = Decimal(config.retry_backoff_base_seconds) * (
+        config.retry_backoff_multiplier ** exponent
+    )
+    if config.retry_backoff_max_seconds > 0:
+        wait = min(wait, Decimal(config.retry_backoff_max_seconds))
+    return max(0, int(wait))
+
+
+def _apply_retry_jitter(wait_seconds: int, jitter_fraction: Decimal) -> int:
+    if wait_seconds <= 0 or jitter_fraction == 0:
+        return wait_seconds
+
+    fraction = float(jitter_fraction)
+    low = wait_seconds * (1.0 - fraction)
+    high = wait_seconds * (1.0 + fraction)
+    return max(0, int(round(random.uniform(low, high))))
+
+
+def _cool_down_provider(
+    *,
+    state: RunState,
+    provider_name: str,
+    now: float,
+    cooldown_seconds: int,
+) -> None:
+    if cooldown_seconds <= 0:
+        return
+    state.provider_cooldowns[provider_name] = now + cooldown_seconds
+
+
+def _select_failover_target(
+    *,
+    provider_slots: tuple[ProviderSlot, ...],
+    current_provider_index: int,
+    cooldowns: dict[str, float],
+    now: float,
+    allow_wrap: bool,
+) -> tuple[int, int] | None:
+    if len(provider_slots) < 2:
+        return None
+
+    soonest_waiting_target: tuple[int, int] | None = None
+    if allow_wrap:
+        candidate_indexes = (
+            (current_provider_index + offset) % len(provider_slots)
+            for offset in range(1, len(provider_slots))
+        )
+    else:
+        candidate_indexes = range(current_provider_index + 1, len(provider_slots))
+
+    for provider_index in candidate_indexes:
+        provider_name = provider_slots[provider_index].execution.name
+        cooldown_until = cooldowns.get(provider_name, 0)
+        if cooldown_until <= now:
+            cooldowns.pop(provider_name, None)
+            return provider_index, 0
+
+        remaining_seconds = max(1, int((cooldown_until - now) + 0.999))
+        if (
+            soonest_waiting_target is None
+            or remaining_seconds < soonest_waiting_target[1]
+        ):
+            soonest_waiting_target = (provider_index, remaining_seconds)
+
+    return soonest_waiting_target
 
 
 def _run_iteration(

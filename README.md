@@ -12,6 +12,8 @@ This is a Python rewrite of the old `ralph.sh` loop runner. The first version ke
 - Codex provider adapter with `codex exec` support and provider-specific validation
 - GitHub Copilot provider adapter with `copilot --output-format json --autopilot` support and provider-specific validation
 - Automatic in-process failover across multiple providers on eligible failures such as rate limits
+- Configurable retry backoff, jitter, and provider cooldowns for long-running loops
+- Run settings loaded from `batonloop.toml`, with CLI flags overriding file values
 - Provider-specific settings loaded from `batonloop-providers.toml`
 - Resume handoff support so a new run can pick up from a prior iteration log, including cross-provider handoff
 - Resume handoff summaries extracted from prior provider logs so the next provider gets a compact state snapshot instead of raw log noise
@@ -27,6 +29,8 @@ python3 -m batonloop --provider copilot -f ./PROMPT.md
 python3 -m batonloop --provider codex -f ./PROMPT.md
 python3 -m batonloop --provider claude --provider codex --provider copilot -f ./PROMPT.md
 python3 -m batonloop --provider codex -f ./PROMPT.md --iteration-timeout 20 --check "pytest -q"
+python3 -m batonloop --provider claude --provider codex -f ./PROMPT.md --retry-backoff-base 30 --retry-backoff-multiplier 2 --retry-backoff-max 600 --retry-jitter 0.2 --provider-cooldown 1800
+python3 -m batonloop --config ./batonloop.toml
 python3 -m batonloop -f ./PROMPT.md --stop-on-regex "DONE" --stop-when-file ./DONE.flag
 python3 -m batonloop --provider codex -f ./PROMPT.md --resume-from ./batonloop-logs --resume-note "Claude hit a usage limit; continue from the in-progress work."
 python3 -m batonloop handoff-summary ./batonloop-logs/iteration-000014.json
@@ -38,6 +42,41 @@ You can also install the local package and use the console script:
 pip install -e .
 batonloop --provider claude -f ./PROMPT.md
 ```
+
+## Run Config
+
+Create `./batonloop.toml` in the directory where you run BatonLoop to define loop settings once. BatonLoop automatically loads this file when it exists; use `--config ./path/to/batonloop.toml` to point at another file. CLI flags override values from the file.
+
+```toml
+[run]
+providers = ["claude", "codex", "copilot"]
+prompt_files = ["./PROMPT.md"]
+iterations = 20
+iteration_timeout = 30
+pause = 10
+max_errors = 4
+wait_on_limit = 30
+retry_backoff_base = 30
+retry_backoff_multiplier = "2"
+retry_backoff_max = 600
+retry_jitter = "0.2"
+provider_cooldown = 1800
+checks = ["pytest -q"]
+safe = true
+live_output = true
+
+[providers.claude]
+safe = true
+
+[providers.codex]
+safe = true
+
+[providers.copilot]
+safe = true
+max_turns = 8
+```
+
+Provider profiles can live in either `batonloop.toml` under `[providers.<name>]` or in the legacy `batonloop-providers.toml` file. If both are present, `batonloop-providers.toml` entries override same-named profiles from `batonloop.toml`.
 
 ## Provider Config
 
@@ -86,6 +125,9 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 - `codex` does not expose explicit cost data in the local JSON stream today, so cost tracking remains `0` unless the CLI starts emitting cost fields.
 - `copilot` does not expose explicit USD cost data in the current JSONL output, so cost tracking remains `0` unless the CLI starts emitting cost fields.
 - Repeat `--provider` to define failover order. BatonLoop keeps using the current provider until it hits an eligible failover condition or you stop the loop.
+- `batonloop.toml` supports a `[run]` table for global loop settings. Common aliases match the CLI wording, such as `providers`, `prompt_files`, `iterations`, `pause`, `max_errors`, `checks`, `retry_backoff_base`, and `provider_cooldown`.
+- Retry policy is configurable. `--retry-backoff-base` enables exponential backoff for nonfatal failures, `--retry-backoff-max` caps it, `--retry-jitter` adds randomized +/- jitter, and provider-specific waits such as rate-limit waits still take precedence when they are longer.
+- `--provider-cooldown` keeps a provider out of failover rotation for the configured number of seconds after a failover-eligible failure. Failover wraps through the configured provider order and waits for the next cooling provider when no provider is immediately available.
 - `--iterations` caps total provider-run attempts, including failed, timed-out, and auto-failover attempts. Prompt rotation still advances on successful iterations so interrupted work resumes the same prompt.
 - `--check` commands are run with the current shell and stop the loop when all configured checks pass.
 - `--stop-on-clean-git` ignores the configured log directory so BatonLoop's own log files do not keep the repo dirty.

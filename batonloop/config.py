@@ -45,6 +45,7 @@ class ProviderExecution:
 @dataclass(frozen=True, slots=True)
 class RunnerConfig:
     working_dir: Path
+    run_config_path: Path | None
     provider_names: tuple[str, ...]
     provider_profiles: dict[str, ProviderProfile]
     provider_config_path: Path | None
@@ -57,6 +58,11 @@ class RunnerConfig:
     iteration_timeout_minutes: Decimal
     pause_seconds: int
     wait_on_limit_mins: int
+    retry_backoff_base_seconds: int
+    retry_backoff_multiplier: Decimal
+    retry_backoff_max_seconds: int
+    retry_jitter_fraction: Decimal
+    provider_cooldown_seconds: int
     max_consecutive_errors: int
     log_dir: Path
     log_retain: int
@@ -146,6 +152,20 @@ def parse_non_negative_decimal(raw: str) -> Decimal:
     return value
 
 
+def parse_decimal_at_least_one(raw: str) -> Decimal:
+    value = parse_non_negative_decimal(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"Expected a decimal >= 1, got {raw!r}.")
+    return value
+
+
+def parse_fraction(raw: str) -> Decimal:
+    value = parse_non_negative_decimal(raw)
+    if value > 1:
+        raise argparse.ArgumentTypeError(f"Expected a decimal between 0 and 1, got {raw!r}.")
+    return value
+
+
 def resolve_provider_execution(config: RunnerConfig, provider_name: str) -> ProviderExecution:
     profile = config.provider_profiles.get(provider_name, ProviderProfile())
     defaults = config.default_provider_profile
@@ -163,7 +183,12 @@ def resolve_provider_execution(config: RunnerConfig, provider_name: str) -> Prov
 
 def build_config(args: argparse.Namespace) -> RunnerConfig:
     working_dir = Path.cwd()
-    raw_prompt_specs = args.prompt_specs or ["./PROMPT.md"]
+    run_config_path = _resolve_run_config_path(
+        working_dir=working_dir,
+        explicit_path=getattr(args, "config", None),
+    )
+    run_settings, run_provider_profiles = _load_run_config(run_config_path)
+    raw_prompt_specs = _coalesce(args.prompt_specs, run_settings.get("prompt_specs"), ["./PROMPT.md"])
     prompt_specs = tuple(
         PromptSpec(
             path=resolve_path(parsed.path, working_dir),
@@ -172,63 +197,340 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         for parsed in (parse_prompt_spec(raw) for raw in raw_prompt_specs)
     )
     prompt_sequence = expand_prompt_specs(prompt_specs)
-    stop_on_regexes = tuple(args.stop_on_regexes or ())
+    stop_on_regexes = tuple(_coalesce(args.stop_on_regexes, run_settings.get("stop_on_regexes"), ()))
     ensure_valid_regexes(stop_on_regexes)
     stop_when_files = tuple(
         resolve_path(Path(raw_path).expanduser(), working_dir)
-        for raw_path in (args.stop_when_files or [])
+        for raw_path in _coalesce(args.stop_when_files, run_settings.get("stop_when_files"), ())
     )
+    resume_from_raw = _coalesce(args.resume_from, run_settings.get("resume_from"), None)
     resume_from = (
-        resolve_path(Path(args.resume_from).expanduser(), working_dir)
-        if args.resume_from
+        resolve_path(Path(resume_from_raw).expanduser(), working_dir)
+        if resume_from_raw
         else None
     )
     provider_config_path = _resolve_provider_config_path(
         working_dir=working_dir,
-        explicit_path=args.provider_config,
+        explicit_path=_coalesce(args.provider_config, run_settings.get("provider_config"), None),
     )
-    provider_profiles = _load_provider_profiles(provider_config_path)
+    provider_profiles = {
+        **run_provider_profiles,
+        **_load_provider_profiles(provider_config_path),
+    }
 
-    output_format = (
-        OutputFormat.JSON if args.no_stream else OutputFormat(args.output_format)
+    output_format_raw = _coalesce(
+        args.output_format,
+        run_settings.get("output_format"),
+        OutputFormat.STREAM_JSON.value,
     )
+    output_format = OutputFormat(output_format_raw)
+    if _coalesce(args.no_stream, run_settings.get("no_stream"), False):
+        output_format = OutputFormat.JSON
+
+    provider_names = tuple(
+        _coalesce(args.provider_names, run_settings.get("provider_names"), ("claude",))
+    )
+    max_iterations = _coalesce(args.max_iterations, run_settings.get("max_iterations"), 0)
+    max_cost = _coalesce(args.max_cost, run_settings.get("max_cost"), Decimal("0"))
+    max_duration_hours = _coalesce(
+        args.max_duration_hours,
+        run_settings.get("max_duration_hours"),
+        Decimal("0"),
+    )
+    iteration_timeout_minutes = _coalesce(
+        args.iteration_timeout_minutes,
+        run_settings.get("iteration_timeout_minutes"),
+        Decimal("0"),
+    )
+    pause_seconds = _coalesce(args.pause_seconds, run_settings.get("pause_seconds"), 5)
+    wait_on_limit_mins = _coalesce(
+        args.wait_on_limit_mins,
+        run_settings.get("wait_on_limit_mins"),
+        30,
+    )
+    retry_backoff_base_seconds = _coalesce(
+        args.retry_backoff_base_seconds,
+        run_settings.get("retry_backoff_base_seconds"),
+        0,
+    )
+    retry_backoff_multiplier = _coalesce(
+        args.retry_backoff_multiplier,
+        run_settings.get("retry_backoff_multiplier"),
+        Decimal("2"),
+    )
+    retry_backoff_max_seconds = _coalesce(
+        args.retry_backoff_max_seconds,
+        run_settings.get("retry_backoff_max_seconds"),
+        0,
+    )
+    retry_jitter_fraction = _coalesce(
+        args.retry_jitter_fraction,
+        run_settings.get("retry_jitter_fraction"),
+        Decimal("0"),
+    )
+    provider_cooldown_seconds = _coalesce(
+        args.provider_cooldown_seconds,
+        run_settings.get("provider_cooldown_seconds"),
+        0,
+    )
+    max_consecutive_errors = _coalesce(
+        args.max_consecutive_errors,
+        run_settings.get("max_consecutive_errors"),
+        5,
+    )
+    max_turns = _coalesce(args.max_turns, run_settings.get("max_turns"), None)
+    log_dir = _coalesce(args.log_dir, run_settings.get("log_dir"), "./batonloop-logs")
+    log_retain = _coalesce(args.log_retain, run_settings.get("log_retain"), 0)
+    check_commands = tuple(_coalesce(args.check_commands, run_settings.get("check_commands"), ()))
+    stop_on_clean_git = _coalesce(
+        args.stop_on_clean_git,
+        run_settings.get("stop_on_clean_git"),
+        False,
+    )
+    live_output = _coalesce(args.live_output, run_settings.get("live_output"), True)
+    resume_note = _coalesce(args.resume_note, run_settings.get("resume_note"), None)
+    dry_run = _coalesce(args.dry_run, run_settings.get("dry_run"), False)
 
     config = RunnerConfig(
         working_dir=working_dir,
-        provider_names=tuple(args.provider_names or ["claude"]),
+        run_config_path=run_config_path,
+        provider_names=provider_names,
         provider_profiles=provider_profiles,
         provider_config_path=provider_config_path,
         default_provider_profile=ProviderProfile(
-            binary=args.provider_binary or None,
-            model=args.model or None,
-            max_turns=args.max_turns,
-            use_bare=args.bare,
-            safe_mode=args.safe,
+            binary=_coalesce(args.provider_binary, run_settings.get("provider_binary"), None),
+            model=_coalesce(args.model, run_settings.get("model"), None),
+            max_turns=max_turns,
+            use_bare=_coalesce(args.bare, run_settings.get("bare"), None),
+            safe_mode=_coalesce(args.safe, run_settings.get("safe"), None),
         ),
         prompt_specs=prompt_specs,
         prompt_sequence=prompt_sequence,
-        max_iterations=args.max_iterations,
-        max_cost=args.max_cost,
-        max_duration_hours=args.max_duration_hours,
-        iteration_timeout_minutes=args.iteration_timeout_minutes,
-        pause_seconds=args.pause_seconds,
-        wait_on_limit_mins=args.wait_on_limit_mins,
-        max_consecutive_errors=args.max_consecutive_errors,
-        log_dir=resolve_path(Path(args.log_dir).expanduser(), working_dir),
-        log_retain=args.log_retain,
-        check_commands=tuple(args.check_commands or ()),
+        max_iterations=max_iterations,
+        max_cost=max_cost,
+        max_duration_hours=max_duration_hours,
+        iteration_timeout_minutes=iteration_timeout_minutes,
+        pause_seconds=pause_seconds,
+        wait_on_limit_mins=wait_on_limit_mins,
+        retry_backoff_base_seconds=retry_backoff_base_seconds,
+        retry_backoff_multiplier=retry_backoff_multiplier,
+        retry_backoff_max_seconds=retry_backoff_max_seconds,
+        retry_jitter_fraction=retry_jitter_fraction,
+        provider_cooldown_seconds=provider_cooldown_seconds,
+        max_consecutive_errors=max_consecutive_errors,
+        log_dir=resolve_path(Path(log_dir).expanduser(), working_dir),
+        log_retain=log_retain,
+        check_commands=check_commands,
         stop_on_regexes=stop_on_regexes,
-        stop_on_clean_git=args.stop_on_clean_git,
+        stop_on_clean_git=stop_on_clean_git,
         stop_when_files=stop_when_files,
         output_format=output_format,
-        live_output=args.live_output,
+        live_output=live_output,
         resume_from=resume_from,
-        resume_note=args.resume_note or None,
-        dry_run=args.dry_run,
+        resume_note=resume_note or None,
+        dry_run=dry_run,
     )
 
     ensure_prompt_files_exist(config.prompt_sequence)
     return config
+
+
+def _coalesce(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_run_config_path(
+    *,
+    working_dir: Path,
+    explicit_path: str | None,
+) -> Path | None:
+    if explicit_path:
+        config_path = resolve_path(Path(explicit_path).expanduser(), working_dir)
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Run config not found: {config_path}")
+        return config_path
+
+    default_path = working_dir / "batonloop.toml"
+    if default_path.is_file():
+        return default_path
+    return None
+
+
+def _load_run_config(path: Path | None) -> tuple[dict[str, Any], dict[str, ProviderProfile]]:
+    if path is None:
+        return {}, {}
+
+    payload = _load_toml_payload(path, description="run config")
+    allowed_top_level_keys = {"run", "providers"}
+    unknown_top_level_keys = sorted(set(payload) - allowed_top_level_keys)
+    if unknown_top_level_keys:
+        raise ValueError(
+            f"Run config {path} contains unsupported top-level key(s): "
+            f"{', '.join(unknown_top_level_keys)}"
+        )
+
+    raw_run_settings = payload.get("run", {})
+    if not isinstance(raw_run_settings, dict):
+        raise ValueError(f"Run config {path} entry [run] must be a table.")
+
+    return _parse_run_settings(raw_run_settings, path), _parse_provider_profiles_payload(
+        payload,
+        path,
+        description="Run config",
+        require_table=False,
+    )
+
+
+def _parse_run_settings(raw_settings: dict[str, Any], path: Path) -> dict[str, Any]:
+    aliases = {
+        "providers": "provider_names",
+        "provider_names": "provider_names",
+        "prompt_files": "prompt_specs",
+        "prompt_specs": "prompt_specs",
+        "provider_config": "provider_config",
+        "provider_binary": "provider_binary",
+        "iterations": "max_iterations",
+        "max_iterations": "max_iterations",
+        "max_cost": "max_cost",
+        "duration_hours": "max_duration_hours",
+        "max_duration_hours": "max_duration_hours",
+        "iteration_timeout": "iteration_timeout_minutes",
+        "iteration_timeout_minutes": "iteration_timeout_minutes",
+        "pause": "pause_seconds",
+        "pause_seconds": "pause_seconds",
+        "model": "model",
+        "wait_on_limit": "wait_on_limit_mins",
+        "wait_on_limit_mins": "wait_on_limit_mins",
+        "retry_backoff_base": "retry_backoff_base_seconds",
+        "retry_backoff_base_seconds": "retry_backoff_base_seconds",
+        "retry_backoff_multiplier": "retry_backoff_multiplier",
+        "retry_backoff_max": "retry_backoff_max_seconds",
+        "retry_backoff_max_seconds": "retry_backoff_max_seconds",
+        "retry_jitter": "retry_jitter_fraction",
+        "retry_jitter_fraction": "retry_jitter_fraction",
+        "provider_cooldown": "provider_cooldown_seconds",
+        "provider_cooldown_seconds": "provider_cooldown_seconds",
+        "max_errors": "max_consecutive_errors",
+        "max_consecutive_errors": "max_consecutive_errors",
+        "max_turns": "max_turns",
+        "log_dir": "log_dir",
+        "log_retain": "log_retain",
+        "checks": "check_commands",
+        "check_commands": "check_commands",
+        "stop_on_regexes": "stop_on_regexes",
+        "stop_on_clean_git": "stop_on_clean_git",
+        "stop_when_files": "stop_when_files",
+        "output_format": "output_format",
+        "no_stream": "no_stream",
+        "live_output": "live_output",
+        "bare": "bare",
+        "safe": "safe",
+        "resume_from": "resume_from",
+        "resume_note": "resume_note",
+        "dry_run": "dry_run",
+    }
+
+    parsed: dict[str, Any] = {}
+    for raw_key, raw_value in raw_settings.items():
+        canonical_key = aliases.get(raw_key)
+        if canonical_key is None:
+            raise ValueError(f"Run config {path} entry [run] contains unsupported key: {raw_key}")
+        if canonical_key in parsed:
+            raise ValueError(
+                f"Run config {path} entry [run] defines {canonical_key} more than once."
+            )
+        parsed[canonical_key] = _parse_run_setting_value(canonical_key, raw_value, path)
+    return parsed
+
+
+def _parse_run_setting_value(key: str, value: Any, path: Path) -> Any:
+    if key in {
+        "provider_names",
+        "prompt_specs",
+        "check_commands",
+        "stop_on_regexes",
+        "stop_when_files",
+    }:
+        return _parse_string_list(value, path, f"[run].{key}")
+    if key in {
+        "provider_config",
+        "provider_binary",
+        "model",
+        "log_dir",
+        "output_format",
+        "resume_from",
+        "resume_note",
+    }:
+        return _parse_optional_string(value, path, f"[run].{key}")
+    if key in {
+        "max_iterations",
+        "pause_seconds",
+        "wait_on_limit_mins",
+        "retry_backoff_base_seconds",
+        "retry_backoff_max_seconds",
+        "provider_cooldown_seconds",
+        "log_retain",
+    }:
+        return _parse_config_int(value, path, f"[run].{key}", parse_non_negative_int)
+    if key in {"max_consecutive_errors", "max_turns"}:
+        return _parse_config_int(value, path, f"[run].{key}", parse_positive_int)
+    if key in {"max_cost", "max_duration_hours", "iteration_timeout_minutes"}:
+        return _parse_config_decimal(value, path, f"[run].{key}", parse_non_negative_decimal)
+    if key == "retry_backoff_multiplier":
+        return _parse_config_decimal(value, path, f"[run].{key}", parse_decimal_at_least_one)
+    if key == "retry_jitter_fraction":
+        return _parse_config_decimal(value, path, f"[run].{key}", parse_fraction)
+    if key in {
+        "stop_on_clean_git",
+        "no_stream",
+        "live_output",
+        "bare",
+        "safe",
+        "dry_run",
+    }:
+        return _parse_bool(value, path, f"[run].{key}")
+    raise AssertionError(f"Unhandled run config key: {key}")
+
+
+def _parse_string_list(value: Any, path: Path, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"Run config {path} entry {field} must be an array of strings.")
+    return tuple(value)
+
+
+def _parse_optional_string(value: Any, path: Path, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"Run config {path} entry {field} must be a string.")
+    return value or None
+
+
+def _parse_bool(value: Any, path: Path, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"Run config {path} entry {field} must be a boolean.")
+    return value
+
+
+def _parse_config_int(value: Any, path: Path, field: str, parser: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"Run config {path} entry {field} must be an integer.")
+    try:
+        return parser(str(value))
+    except argparse.ArgumentTypeError as exc:
+        raise ValueError(f"Run config {path} entry {field}: {exc}") from exc
+
+
+def _parse_config_decimal(value: Any, path: Path, field: str, parser: Any) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError(f"Run config {path} entry {field} must be a decimal.")
+    try:
+        return parser(str(value))
+    except argparse.ArgumentTypeError as exc:
+        raise ValueError(f"Run config {path} entry {field}: {exc}") from exc
 
 
 def _resolve_provider_config_path(
@@ -255,25 +557,46 @@ def _load_provider_profiles(path: Path | None) -> dict[str, ProviderProfile]:
     if path is None:
         return {}
 
+    payload = _load_toml_payload(path, description="provider config")
+    return _parse_provider_profiles_payload(
+        payload,
+        path,
+        description="Provider config",
+        require_table=True,
+    )
+
+
+def _load_toml_payload(path: Path, *, description: str) -> dict[str, Any]:
     try:
         with path.open("rb") as handle:
             payload = tomllib.load(handle)
     except OSError as exc:
-        raise FileNotFoundError(f"Unable to read provider config: {path}") from exc
+        raise FileNotFoundError(f"Unable to read {description}: {path}") from exc
     except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"Invalid provider config {path}: {exc}") from exc
+        raise ValueError(f"Invalid {description} {path}: {exc}") from exc
+    return payload
 
+
+def _parse_provider_profiles_payload(
+    payload: dict[str, Any],
+    path: Path,
+    *,
+    description: str,
+    require_table: bool,
+) -> dict[str, ProviderProfile]:
     providers = payload.get("providers", {})
+    if providers == {} and not require_table:
+        return {}
     if not isinstance(providers, dict):
-        raise ValueError(f"Provider config {path} must define a [providers] table.")
+        raise ValueError(f"{description} {path} must define a [providers] table.")
 
     profiles: dict[str, ProviderProfile] = {}
     for provider_name, raw_profile in providers.items():
         if not isinstance(provider_name, str) or not provider_name:
-            raise ValueError(f"Provider config {path} contains an invalid provider name.")
+            raise ValueError(f"{description} {path} contains an invalid provider name.")
         if not isinstance(raw_profile, dict):
             raise ValueError(
-                f"Provider config {path} entry [providers.{provider_name}] must be a table."
+                f"{description} {path} entry [providers.{provider_name}] must be a table."
             )
         profiles[provider_name] = _parse_provider_profile(provider_name, raw_profile, path)
 

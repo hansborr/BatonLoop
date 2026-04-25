@@ -523,7 +523,7 @@ class RunnerTests(unittest.TestCase):
 
             exit_code = run_loop(config, {"fake": provider})
 
-            self.assertEqual(exit_code, 0)
+            self.assertEqual(exit_code, 1)
             self.assertTrue((config.log_dir / "iteration-000001.json").is_file())
             self.assertTrue((config.log_dir / "iteration-000002.json").is_file())
             self.assertTrue((config.log_dir / "iteration-000003.json").is_file())
@@ -590,7 +590,7 @@ class RunnerTests(unittest.TestCase):
 
             exit_code = run_loop(config, providers)
 
-            self.assertEqual(exit_code, 0)
+            self.assertEqual(exit_code, 1)
             self.assertTrue((config.log_dir / "iteration-000001.json").is_file())
             self.assertFalse((config.log_dir / "iteration-000002.json").exists())
 
@@ -672,6 +672,138 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(outcome.next_provider_index, 1)
             self.assertFalse(outcome.should_break)
             self.assertEqual(state.consecutive_errors, 0)
+
+    def test_retry_backoff_applies_to_nonfatal_failures(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=3,
+                retry_backoff_base_seconds=2,
+                retry_backoff_multiplier=Decimal("3"),
+                retry_backoff_max_seconds=5,
+            )
+            config.log_dir.mkdir()
+            iteration_log = config.log_dir / "iteration-000002.json"
+            iteration_log.write_text("boom", encoding="utf-8")
+            prompt_path = config.prompt_sequence[0]
+
+            logger = logging.getLogger("batonloop.test.retry-backoff")
+            logger.handlers.clear()
+            logger.addHandler(logging.NullHandler())
+            controller = StopController(logger)
+            state = RunState(
+                start_time=0.0,
+                attempted_iterations=2,
+                consecutive_errors=1,
+            )
+            slot = ProviderSlot(
+                provider=StaticCommandProvider(
+                    [sys.executable, "-c", "import sys; sys.exit(1)"],
+                    failure_decision=FailureDecision(message="temporary failure"),
+                ),
+                execution=ProviderExecution(
+                    name="fake",
+                    binary=sys.executable,
+                    model=None,
+                    max_turns=None,
+                    use_bare=False,
+                    safe_mode=False,
+                ),
+            )
+            iteration = IterationExecution(
+                number=2,
+                slot=slot,
+                prompt_path=prompt_path,
+                prompt_input_path=prompt_path,
+                log_path=iteration_log,
+                result=CommandResult(exit_code=1),
+            )
+
+            outcome = _handle_iteration_outcome(
+                logger=logger,
+                config=config,
+                state=state,
+                controller=controller,
+                iteration=iteration,
+                provider_slots=(slot,),
+                current_provider_index=0,
+            )
+
+            self.assertEqual(outcome.wait_seconds, 5)
+            self.assertTrue(outcome.skip_pause_after_wait)
+            self.assertFalse(outcome.should_break)
+
+    def test_provider_cooldown_waits_for_next_available_failover_target(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=3,
+                provider_names=("limited", "backup"),
+                provider_cooldown_seconds=60,
+            )
+            config.log_dir.mkdir()
+            iteration_log = config.log_dir / "iteration-000001.json"
+            iteration_log.write_text("rate limited", encoding="utf-8")
+            prompt_path = config.prompt_sequence[0]
+
+            logger = logging.getLogger("batonloop.test.provider-cooldown")
+            logger.handlers.clear()
+            logger.addHandler(logging.NullHandler())
+            controller = StopController(logger)
+            state = RunState(
+                start_time=0.0,
+                attempted_iterations=1,
+                provider_cooldowns={"limited": 150.0},
+            )
+            limited_slot = ProviderSlot(
+                provider=RateLimitedProvider(),
+                execution=ProviderExecution(
+                    name="limited",
+                    binary=sys.executable,
+                    model=None,
+                    max_turns=None,
+                    use_bare=False,
+                    safe_mode=False,
+                ),
+            )
+            backup_slot = ProviderSlot(
+                provider=RateLimitedProvider(),
+                execution=ProviderExecution(
+                    name="backup",
+                    binary=sys.executable,
+                    model=None,
+                    max_turns=None,
+                    use_bare=False,
+                    safe_mode=False,
+                ),
+            )
+            iteration = IterationExecution(
+                number=1,
+                slot=backup_slot,
+                prompt_path=prompt_path,
+                prompt_input_path=prompt_path,
+                log_path=iteration_log,
+                result=CommandResult(exit_code=1),
+            )
+
+            with patch("batonloop.runner.time.monotonic", return_value=100.0):
+                outcome = _handle_iteration_outcome(
+                    logger=logger,
+                    config=config,
+                    state=state,
+                    controller=controller,
+                    iteration=iteration,
+                    provider_slots=(limited_slot, backup_slot),
+                    current_provider_index=1,
+                )
+
+            self.assertEqual(outcome.failover_target_provider, "limited")
+            self.assertEqual(outcome.next_provider_index, 0)
+            self.assertEqual(outcome.wait_seconds, 50)
+            self.assertTrue(outcome.skip_pause_after_wait)
+            self.assertEqual(state.provider_cooldowns["backup"], 160.0)
 
 
 class StaticCommandProvider:
@@ -799,11 +931,17 @@ def _make_config(
     provider_names: tuple[str, ...] = ("fake",),
     provider_profiles: dict[str, ProviderProfile] | None = None,
     live_output: bool = True,
+    retry_backoff_base_seconds: int = 0,
+    retry_backoff_multiplier: Decimal = Decimal("2"),
+    retry_backoff_max_seconds: int = 0,
+    retry_jitter_fraction: Decimal = Decimal("0"),
+    provider_cooldown_seconds: int = 0,
 ) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
         working_dir=temp_root,
+        run_config_path=None,
         provider_names=provider_names,
         provider_profiles=provider_profiles or {},
         provider_config_path=None,
@@ -816,6 +954,11 @@ def _make_config(
         iteration_timeout_minutes=iteration_timeout_minutes,
         pause_seconds=0,
         wait_on_limit_mins=30,
+        retry_backoff_base_seconds=retry_backoff_base_seconds,
+        retry_backoff_multiplier=retry_backoff_multiplier,
+        retry_backoff_max_seconds=retry_backoff_max_seconds,
+        retry_jitter_fraction=retry_jitter_fraction,
+        provider_cooldown_seconds=provider_cooldown_seconds,
         max_consecutive_errors=max_consecutive_errors,
         log_dir=temp_root / "batonloop-logs",
         log_retain=0,

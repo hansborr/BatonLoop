@@ -218,6 +218,7 @@ def _make_config(
     prompt_path.write_text("prompt", encoding="utf-8")
     return RunnerConfig(
         working_dir=temp_root,
+        run_config_path=None,
         provider_names=("claude",),
         provider_profiles={
             "claude": ProviderProfile(
@@ -236,6 +237,11 @@ def _make_config(
         iteration_timeout_minutes=Decimal("0"),
         pause_seconds=5,
         wait_on_limit_mins=30,
+        retry_backoff_base_seconds=0,
+        retry_backoff_multiplier=Decimal("2"),
+        retry_backoff_max_seconds=0,
+        retry_jitter_fraction=Decimal("0"),
+        provider_cooldown_seconds=0,
         max_consecutive_errors=5,
         log_dir=temp_root / "logs",
         log_retain=0,
