@@ -18,7 +18,14 @@ from batonloop.config import (
     ProviderProfile,
     RunnerConfig,
 )
-from batonloop.handoff import extract_handoff_summary, metadata_path_for, prompt_artifact_path_for
+from batonloop.handoff import (
+    build_resume_prompt,
+    extract_handoff_details,
+    extract_handoff_summary,
+    metadata_path_for,
+    prompt_artifact_path_for,
+    resolve_resume_context,
+)
 from batonloop.providers.base import FailureDecision, FailureKind
 from batonloop.runner import (
     CommandResult,
@@ -172,15 +179,17 @@ class RunnerTests(unittest.TestCase):
                 json.dumps(
                     {
                         "provider_name": "claude",
+                        "handoff_extractor_version": 2,
                         "base_prompt_path": str(temp_root / "OLD_PROMPT.md"),
                         "exit_code": 1,
                         "timed_out": False,
                         "failure_message": "RATE LIMITED detected in output.",
                         "handoff_summary": (
                             "Previous iteration summary:\n"
-                            "- Goal: Resume the interrupted task.\n"
+                            "- State: Resume the interrupted task.\n"
                             "- Interruption: RATE LIMITED."
                         ),
+                        "retry_recommended_next_step": "Resume the interrupted task.",
                     }
                 ),
                 encoding="utf-8",
@@ -206,7 +215,8 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("Previous provider: claude", log_text)
             self.assertIn("Previous exit code: 1", log_text)
             self.assertIn("Previous iteration summary:", log_text)
-            self.assertIn("Goal: Resume the interrupted task.", log_text)
+            self.assertIn("State: Resume the interrupted task.", log_text)
+            self.assertIn("Recommended resume point: Resume the interrupted task.", log_text)
             self.assertIn(
                 "Operator note: Switch providers and continue from the partial work.",
                 log_text,
@@ -285,7 +295,7 @@ class RunnerTests(unittest.TestCase):
 
             assert summary is not None
             self.assertIn("Previous iteration summary:", summary)
-            self.assertIn("Goal: Now I have the picture. Phase 4.3 is the next recommended task", summary)
+            self.assertIn("State: Now I have the picture. Phase 4.3 is the next recommended task", summary)
             self.assertIn("Progress checkpoint: Lint, typecheck, and test all pass.", summary)
             self.assertIn("In-flight task: Critical review of Phase 4.3a:", summary)
             self.assertIn("Interruption: You've hit your limit - resets 7am.", summary)
@@ -328,7 +338,7 @@ class RunnerTests(unittest.TestCase):
             summary = extract_handoff_summary(log_path, provider_hint="claude")
 
             assert summary is not None
-            self.assertIn("Goal: Phase 5.0 is the next recommended task.", summary)
+            self.assertIn("State: Phase 5.0 is the next recommended task.", summary)
             self.assertNotIn("Completed successfully", summary)
             self.assertNotIn("Interruption:", summary)
 
@@ -357,7 +367,7 @@ class RunnerTests(unittest.TestCase):
 
             assert summary is not None
             self.assertIn("Previous iteration summary:", summary)
-            self.assertIn("Goal: Phase 5.0 is the next recommended task.", summary)
+            self.assertIn("State: Phase 5.0 is the next recommended task.", summary)
             self.assertNotIn("Interruption:", summary)
 
     def test_extract_handoff_summary_from_codex_log(self) -> None:
@@ -440,7 +450,7 @@ class RunnerTests(unittest.TestCase):
 
             assert summary is not None
             self.assertIn("Previous iteration summary:", summary)
-            self.assertIn("Goal: I have enough context to work the actual 5.0 slice.", summary)
+            self.assertIn("State: I have enough context to work the actual 5.0 slice.", summary)
             self.assertIn("Progress checkpoint: Lint and typecheck are clean.", summary)
             self.assertIn(
                 "Checklist: 2/3 complete; remaining: Run verification, update notes, review, and commit",
@@ -485,7 +495,7 @@ class RunnerTests(unittest.TestCase):
                 summary = extract_handoff_summary(log_path, provider_hint="claude")
 
             assert summary is not None
-            self.assertIn("Goal: Phase 5.1 is the next recommended task.", summary)
+            self.assertIn("State: Phase 5.1 is the next recommended task.", summary)
             self.assertIn("Interruption: You've hit your usage limit.", summary)
 
     def test_extract_handoff_summary_prefers_late_actionable_recovery_notes(self) -> None:
@@ -557,10 +567,221 @@ class RunnerTests(unittest.TestCase):
             summary = extract_handoff_summary(log_path, provider_hint="claude")
 
             assert summary is not None
-            self.assertIn("Goal: Reviewer flagged two blockers:", summary)
+            self.assertIn("State: Reviewer flagged two blockers:", summary)
             self.assertIn("useCastPlacement.dispatch", summary)
             self.assertIn("Last activity: Now I'll apply the two fixes.", summary)
-            self.assertNotIn("Goal: Now I have enough context.", summary)
+            self.assertNotIn("State: Now I have enough context.", summary)
+
+    def test_extract_handoff_summary_prefers_shipped_state_over_filler_progress(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000002.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        _agent_message("Now I have enough context. Let me update the store."),
+                        _agent_message(
+                            "Phase 5.2 (cast-rail slot picker interactivity) is shipped "
+                            "on `vtt` as commits `5c050b6` + `d6ff0c7`."
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="codex")
+
+            assert summary is not None
+            self.assertIn("State: Phase 5.2 (cast-rail slot picker interactivity) is shipped", summary)
+            self.assertNotIn("State: Now I have enough context.", summary)
+
+    def test_extract_handoff_summary_prefers_committed_state_over_exploration(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000003.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        _agent_message("Now let me check the current roadmap notes."),
+                        _agent_message(
+                            "Phase 5.3 is shipped and committed. Both commits are on `vtt`, "
+                            "working tree is clean, and the roadmap docs point the next agent "
+                            "at Phase 5.4."
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="codex")
+
+            assert summary is not None
+            self.assertIn("State: Phase 5.3 is shipped and committed.", summary)
+            self.assertNotIn("State: Now let me check", summary)
+
+    def test_extract_handoff_summary_selects_commit_failed_recovery_note(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000005.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        _agent_message("Now update phase-5-spell-cast.md to mark 5.5 as shipped:"),
+                        _agent_message("All 181 files / 2931 tests pass. Now let me commit the work."),
+                        _agent_message("The commit failed. Let me check the output."),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            details = extract_handoff_details(log_path, provider_hint="codex")
+
+            assert details.summary is not None
+            self.assertIn("State: The commit failed. Let me check the output.", details.summary)
+            self.assertEqual(
+                details.retry_recommended_next_step,
+                "The commit failed. Let me check the output.",
+            )
+
+    def test_extract_handoff_summary_avoids_complete_picture_for_rate_limit(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000006.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        _agent_message("Now I have a complete picture. Let me start the implementation."),
+                        _agent_message(
+                            "The lint error is in pre-existing staged work from Phase 5.4. "
+                            "Let me first commit my Phase 6.1 changes separately."
+                        ),
+                        json.dumps(
+                            {
+                                "type": "turn.failed",
+                                "error": {"message": "You've hit your usage limit."},
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="codex")
+
+            assert summary is not None
+            self.assertIn("State: The lint error is in pre-existing staged work", summary)
+            self.assertNotIn("State: Now I have a complete picture.", summary)
+            self.assertIn("Interruption: You've hit your usage limit.", summary)
+
+    def test_extract_handoff_summary_keeps_generic_chatter_as_last_resort(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000007.json"
+            log_path.write_text(
+                _agent_message("Now I have enough context. Let me check the next file."),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="codex")
+
+            assert summary is not None
+            self.assertIn("Previous iteration summary:", summary)
+            self.assertIn("State: Now I have enough context. Let me check the next file.", summary)
+
+    def test_resolve_resume_context_reextracts_old_metadata_summary(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            log_path = temp_root / "iteration-000001.json"
+            log_path.write_text(
+                _agent_message("Phase 8.1 is shipped and committed. Working tree is clean."),
+                encoding="utf-8",
+            )
+            metadata_path_for(log_path).write_text(
+                json.dumps(
+                    {
+                        "provider_name": "codex",
+                        "handoff_summary": (
+                            "Previous iteration summary:\n"
+                            "- Goal: Now I have enough context. Let me update the store."
+                        ),
+                        "retry_recommended_next_step": "Now I have enough context.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            context = resolve_resume_context(log_path)
+
+            assert context.previous_handoff_summary is not None
+            self.assertIn("State: Phase 8.1 is shipped and committed.", context.previous_handoff_summary)
+            self.assertNotIn("Now I have enough context", context.previous_handoff_summary)
+            self.assertEqual(
+                context.previous_retry_recommended_next_step,
+                "Phase 8.1 is shipped and committed. Working tree is clean.",
+            )
+
+    def test_resolve_resume_context_reuses_current_version_metadata(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            log_path = temp_root / "iteration-000001.json"
+            log_path.write_text(
+                _agent_message("Phase 8.1 is shipped and committed. Working tree is clean."),
+                encoding="utf-8",
+            )
+            metadata_path_for(log_path).write_text(
+                json.dumps(
+                    {
+                        "provider_name": "codex",
+                        "handoff_extractor_version": 2,
+                        "handoff_summary": "Previous iteration summary:\n- State: Cached summary.",
+                        "retry_recommended_next_step": "Cached next step.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("batonloop.handoff.extract_handoff_details", side_effect=AssertionError):
+                context = resolve_resume_context(log_path)
+
+            self.assertEqual(
+                context.previous_handoff_summary,
+                "Previous iteration summary:\n- State: Cached summary.",
+            )
+            self.assertEqual(context.previous_retry_recommended_next_step, "Cached next step.")
+
+    def test_build_resume_prompt_includes_recommended_resume_point(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            base_prompt_path = temp_root / "PROMPT.md"
+            base_prompt_path.write_text("base prompt", encoding="utf-8")
+            log_path = temp_root / "iteration-000001.json"
+            log_path.write_text(
+                _agent_message("All tests pass. Now commit the work."),
+                encoding="utf-8",
+            )
+            metadata_path_for(log_path).write_text(
+                json.dumps(
+                    {
+                        "handoff_extractor_version": 2,
+                        "handoff_summary": (
+                            "Previous iteration summary:\n"
+                            "- State: All tests pass. Now commit the work."
+                        ),
+                        "retry_recommended_next_step": "All tests pass. Now commit the work.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            context = resolve_resume_context(log_path)
+
+            prompt = build_resume_prompt(
+                base_prompt_path=base_prompt_path,
+                current_provider_name="codex",
+                working_dir=temp_root,
+                log_dir=temp_root / "logs",
+                resume_context=context,
+                resume_note=None,
+            )
+
+            self.assertIn(
+                "Recommended resume point: All tests pass. Now commit the work.",
+                prompt,
+            )
 
     def test_failure_iteration_writes_metadata_for_future_resume(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -579,6 +800,7 @@ class RunnerTests(unittest.TestCase):
                 )
             )
             self.assertEqual(metadata["provider_name"], "fake")
+            self.assertEqual(metadata["handoff_extractor_version"], 2)
             self.assertEqual(metadata["exit_code"], 1)
             self.assertFalse(metadata["success"])
             self.assertEqual(metadata["failure_message"], "process failed with exit code 1")
@@ -674,7 +896,11 @@ class RunnerTests(unittest.TestCase):
                 prompt_text,
             )
             self.assertIn("Previous exit code: 1", prompt_text)
-            self.assertIn("Goal: All tests pass. Now commit the work.", prompt_text)
+            self.assertIn("State: All tests pass. Now commit the work.", prompt_text)
+            self.assertIn(
+                "Recommended resume point: All tests pass. Now commit the work.",
+                prompt_text,
+            )
 
             second_metadata = json.loads(
                 metadata_path_for(second_iteration_log).read_text(encoding="utf-8")
@@ -1107,6 +1333,18 @@ class ResumeEchoProvider:
     ) -> FailureDecision:
         del exit_code, log_path, config, execution
         return FailureDecision(message="unexpected failure")
+
+
+def _agent_message(text: str) -> str:
+    return json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": text,
+            },
+        }
+    )
 
 
 def _make_config(

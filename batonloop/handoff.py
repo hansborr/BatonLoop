@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from shutil import which
-from typing import Any
+from typing import Any, Callable
 
 from .config import ProviderExecution
 
@@ -18,6 +18,7 @@ _ITERATION_ARTIFACT_STEM = re.compile(r"^(iteration-\d{6})(?:\..+)?$")
 _MAX_SUMMARY_WORDS = 500
 _MAX_TEXT_SNIPPET_CHARS = 240
 _MAX_TASK_SNIPPET_CHARS = 320
+_HANDOFF_EXTRACTOR_VERSION = 2
 _INTERRUPTION_PATTERNS = (
     "hit your limit",
     "usage limit",
@@ -44,6 +45,7 @@ class ResumeContext:
     previous_failure_message: str | None
     previous_stop_reason: str | None
     previous_handoff_summary: str | None
+    previous_retry_recommended_next_step: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,11 +83,25 @@ def resolve_resume_context(path: Path) -> ResumeContext:
     source_metadata_path = metadata_path_for(source_log_path)
     metadata = _load_metadata(source_metadata_path) if source_metadata_path.is_file() else None
     previous_provider = _string_field(metadata, "provider_name")
-    previous_handoff_summary = _string_field(metadata, "handoff_summary")
-    if previous_handoff_summary is None:
-        previous_handoff_summary = extract_handoff_summary(
+    cached_extractor_version = _int_field(metadata, "handoff_extractor_version")
+    if (
+        metadata is not None
+        and cached_extractor_version is not None
+        and cached_extractor_version >= _HANDOFF_EXTRACTOR_VERSION
+    ):
+        previous_handoff_summary = _string_field(metadata, "handoff_summary")
+        previous_retry_recommended_next_step = _string_field(
+            metadata,
+            "retry_recommended_next_step",
+        )
+    else:
+        handoff_details = extract_handoff_details(
             source_log_path,
             provider_hint=previous_provider,
+        )
+        previous_handoff_summary = handoff_details.summary
+        previous_retry_recommended_next_step = (
+            handoff_details.retry_recommended_next_step
         )
 
     return ResumeContext(
@@ -98,6 +114,7 @@ def resolve_resume_context(path: Path) -> ResumeContext:
         previous_failure_message=_string_field(metadata, "failure_message"),
         previous_stop_reason=_string_field(metadata, "stop_reason"),
         previous_handoff_summary=previous_handoff_summary,
+        previous_retry_recommended_next_step=previous_retry_recommended_next_step,
     )
 
 
@@ -146,6 +163,7 @@ def write_iteration_metadata(
     handoff_details = extract_handoff_details(log_path, provider_hint=execution.name)
     payload = {
         "version": 1,
+        "handoff_extractor_version": _HANDOFF_EXTRACTOR_VERSION,
         "provider_name": execution.name,
         "provider_binary": execution.binary,
         "provider_model": execution.model,
@@ -373,6 +391,11 @@ def _render_resume_block(
         lines.append(f"Previous stop reason: {resume_context.previous_stop_reason}")
     if resume_context.previous_handoff_summary:
         lines.append(resume_context.previous_handoff_summary)
+    if resume_context.previous_retry_recommended_next_step:
+        lines.append(
+            "Recommended resume point: "
+            f"{resume_context.previous_retry_recommended_next_step}"
+        )
 
     git_status = get_git_status_snapshot(working_dir, log_dir)
     if git_status:
@@ -709,12 +732,12 @@ def _render_handoff_summary(
     message_pool = _dedupe_messages(messages) or _dedupe_messages(fallback_user_messages)
     lines: list[str] = []
 
-    goal = _pick_goal_message(message_pool)
-    if goal:
-        lines.append(f"- Goal: {goal}")
+    state = _pick_state_message(message_pool)
+    if state:
+        lines.append(f"- State: {state}")
 
     checkpoint = _pick_verification_checkpoint(message_pool)
-    if checkpoint and checkpoint != goal:
+    if checkpoint and checkpoint != state:
         lines.append(f"- Progress checkpoint: {checkpoint}")
 
     if todo_snapshot is not None:
@@ -729,7 +752,7 @@ def _render_handoff_summary(
     last_activity = _pick_last_activity(message_pool)
     if (
         last_activity
-        and last_activity not in {goal, checkpoint}
+        and last_activity not in {state, checkpoint}
         and (task_line is None or _is_actionable_recovery_message(last_activity))
     ):
         lines.append(f"- Last activity: {last_activity}")
@@ -744,29 +767,55 @@ def _render_handoff_summary(
     return _truncate_to_word_limit(summary, max_words=_MAX_SUMMARY_WORDS)
 
 
-def _pick_goal_message(messages: list[str]) -> str | None:
+def _pick_state_message(messages: list[str]) -> str | None:
     if not messages:
         return None
 
-    best_index = 0
+    terminal = _pick_best_message(messages, _is_terminal_state_message)
+    if terminal is not None:
+        return terminal
+
+    recovery = _pick_best_message(
+        messages,
+        _is_actionable_recovery_message,
+        priority=_recovery_message_priority,
+    )
+    if recovery is not None:
+        return recovery
+
+    next_work = _pick_best_message(messages, _is_explicit_next_work_message)
+    if next_work is not None:
+        return next_work
+
+    non_generic = _pick_best_message(
+        messages,
+        lambda text: not _is_generic_context_progress_message(text),
+        priority=_state_message_priority,
+    )
+    if non_generic is not None:
+        return non_generic
+
+    return _truncate_text(messages[-1], max_chars=_MAX_TEXT_SNIPPET_CHARS)
+
+
+def _pick_best_message(
+    messages: list[str],
+    predicate: Callable[[str], bool],
+    *,
+    priority: Callable[[str], float] | None = None,
+) -> str | None:
+    best_index: int | None = None
     best_score = float("-inf")
-    last_index = len(messages) - 1
     for index, text in enumerate(messages):
-        score = _score_goal_message(text)
-        if index <= 7:
-            score -= index * 0.25
-        else:
-            score -= 2.0
-        if index >= max(0, last_index - 5):
-            score += 1.5
-        if _is_actionable_recovery_message(text):
-            score += 8.0
-            score += min(index, 20) * 0.12
-        if _is_generic_context_progress_message(text):
-            score -= 6.0
-        if score > best_score:
+        if not predicate(text):
+            continue
+        score = priority(text) if priority is not None else 0.0
+        score += min(index, 40) * 0.01
+        if score >= best_score:
             best_score = score
             best_index = index
+    if best_index is None:
+        return None
     return _truncate_text(messages[best_index], max_chars=_MAX_TEXT_SNIPPET_CHARS)
 
 
@@ -843,15 +892,23 @@ def _pick_retry_next_step(
             max_chars=_MAX_TEXT_SNIPPET_CHARS,
         )
 
-    last_activity = _pick_last_activity(message_pool)
-    if last_activity is not None:
-        return last_activity
+    for text in reversed(message_pool):
+        if (
+            _is_actionable_recovery_message(text)
+            or _is_terminal_state_message(text)
+            or _is_explicit_next_work_message(text)
+        ):
+            return _truncate_text(text, max_chars=_MAX_TEXT_SNIPPET_CHARS)
 
     task_summary = _render_task_summary(tasks)
     if task_summary is not None:
         return task_summary
 
-    return None
+    for text in reversed(message_pool):
+        if not _is_interruption_text(text) and not _is_generic_context_progress_message(text):
+            return _truncate_text(text, max_chars=_MAX_TEXT_SNIPPET_CHARS)
+
+    return _pick_last_activity(message_pool)
 
 
 def _compact_task_prompt(prompt: str | None) -> str | None:
@@ -889,20 +946,83 @@ def _dedupe_messages(messages: list[str]) -> list[str]:
     return deduped
 
 
-def _score_goal_message(text: str) -> float:
+def _state_message_priority(text: str) -> float:
     lowered = text.lower()
     score = min(len(text), 240) / 120
-    if any(token in lowered for token in ("next recommended task", "next leaf task", "current hot task")):
+    if _is_explicit_next_work_message(text):
         score += 7
     if any(token in lowered for token in ("plan is", "switching to", "the queue confirms")):
         score += 5
-    if any(token in lowered for token in ("i have enough context", "i have the")):
-        score += 3
     if any(token in lowered for token in ("phase ", "wire ", "implement", "add ", "update ", "fix ")):
         score += 2
     if any(token in lowered for token in ("checking the repo state", "reading", "let me explore")):
         score -= 1
     return score
+
+
+def _is_terminal_state_message(text: str) -> bool:
+    lowered = text.lower()
+    if any(
+        token in lowered
+        for token in (
+            "working tree clean",
+            "worktree is clean",
+            "nothing further to do",
+            "no further action",
+        )
+    ):
+        return True
+    return any(
+        re.search(pattern, lowered) is not None
+        for pattern in (
+            r"\b(is|are|was|were) shipped\b",
+            r"\bshipped and committed\b",
+            r"\b(is|are|was|were) committed\b",
+            r"\bcommitted\b",
+            r"\b(is|are|was|were) implemented\b",
+            r"\bimplemented and committed\b",
+            r"\b(is|are|was|were) landed\b",
+            r"\blanded and committed\b",
+        )
+    )
+
+
+def _is_explicit_next_work_message(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        token in lowered
+        for token in (
+            "next recommended task",
+            "next leaf task",
+            "next task is",
+            "current hot task",
+            "queue points to",
+            "queue confirms",
+            "next up",
+            "resume point",
+        )
+    )
+
+
+def _recovery_message_priority(text: str) -> float:
+    lowered = text.lower()
+    if any(token in lowered for token in ("reviewer flagged", "review flagged", "blocker")):
+        return 4.0
+    if any(token in lowered for token in ("commit failed", "failed to commit")):
+        return 4.0
+    if any(
+        token in lowered
+        for token in (
+            "failed verification",
+            "verification failed",
+            "tests failed",
+            "test failed",
+        )
+    ):
+        return 3.0
+    if any(token in lowered for token in ("apply", "fix")):
+        return 1.0
+    return 2.0
 
 
 def _is_actionable_recovery_message(text: str) -> bool:
@@ -914,12 +1034,21 @@ def _is_actionable_recovery_message(text: str) -> bool:
             "review flagged",
             "flagged two",
             "blocker",
+            "blocked",
             "commit failed",
             "failed to commit",
+            "failed verification",
+            "verification failed",
+            "tests failed",
+            "test failed",
             "now i'll apply",
             "now i will apply",
+            "apply fixes",
             "apply the fix",
+            "apply the fixes",
             "apply the two fixes",
+            "fix the blocker",
+            "fix the blockers",
             "wait for git commit",
             "all tests pass. now commit",
             "all verification passes. now commit",
@@ -929,14 +1058,37 @@ def _is_actionable_recovery_message(text: str) -> bool:
 
 def _is_generic_context_progress_message(text: str) -> bool:
     lowered = text.lower()
+    if (
+        _is_terminal_state_message(text)
+        or _is_actionable_recovery_message(text)
+        or _is_explicit_next_work_message(text)
+        or "plan is" in lowered
+    ):
+        return False
     return any(
         token in lowered
         for token in (
+            "now i have enough context",
+            "i have enough context",
+            "now i have the full picture",
+            "now i have a full picture",
+            "now i have the complete picture",
+            "now i have a complete picture",
+            "now i have what i need",
             "now i have enough context. let me start implementing",
             "now i have enough context. let me start the implementation",
             "now i have a complete picture. let me start implementing",
             "now i have a complete picture. let me start the implementation",
             "now i have what i need. let me create",
+            "now let me check",
+            "now let me read",
+            "now let me open",
+            "now let me look",
+            "now let me grep",
+            "let me grep",
+            "i'll start by reading",
+            "i will start by reading",
+            "i’ll start by reading",
         )
     )
 

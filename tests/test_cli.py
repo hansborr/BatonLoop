@@ -50,7 +50,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             output = stdout.getvalue()
             self.assertIn("Previous iteration summary:", output)
-            self.assertIn("Goal: Phase 4.3 is the next recommended task.", output)
+            self.assertIn("State: Phase 4.3 is the next recommended task.", output)
             self.assertIn("Interruption: You've hit your usage limit.", output)
 
     def test_handoff_summary_command_accepts_log_directory(self) -> None:
@@ -103,7 +103,7 @@ class CliTests(unittest.TestCase):
                 json.dumps(
                     {
                         "success": False,
-                        "handoff_summary": "Previous iteration summary:\n- Goal: Fix retry.",
+                        "handoff_summary": "Previous iteration summary:\n- State: Fix retry.",
                     }
                 ),
                 encoding="utf-8",
@@ -142,7 +142,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             output = stdout.getvalue()
             self.assertIn("Iteration 000002", output)
-            self.assertIn("Goal: Fix retry.", output)
+            self.assertIn("State: Fix retry.", output)
             self.assertIn("Generated prompt artifact: no", output)
             self.assertIn("WARNING: previous iteration failed", output)
             self.assertIn("Starting from the base prompt.", output)
