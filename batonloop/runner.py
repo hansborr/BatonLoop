@@ -250,11 +250,13 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
 
             if outcome.success:
                 _rotate_logs(config.log_dir, config.log_retain)
+                resume_context = None
+            elif not outcome.should_break:
+                resume_context = resolve_resume_context(iteration.log_path)
 
             if outcome.next_provider_index is not None:
                 current_provider_index = outcome.next_provider_index
                 state.consecutive_errors = 0
-                resume_context = resolve_resume_context(iteration.log_path)
                 if outcome.wait_seconds > 0:
                     _interruptible_sleep(outcome.wait_seconds, controller)
                 continue

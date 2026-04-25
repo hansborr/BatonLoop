@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from .config import (
     OutputFormat,
@@ -15,7 +17,7 @@ from .config import (
     parse_positive_int,
     resolve_path,
 )
-from .handoff import resolve_resume_context
+from .handoff import prompt_artifact_path_for, resolve_resume_context
 from .providers import ClaudeProvider, CopilotProvider, CodexProvider
 from .runner import run_loop
 
@@ -257,6 +259,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Print the extracted resume handoff summary for an iteration log.",
     )
     _add_handoff_summary_arguments(handoff_parser)
+    inspect_parser = subparsers.add_parser(
+        "inspect-handoff",
+        help="Inspect whether iterations received generated handoff prompts.",
+        description="Inspect whether iterations received generated handoff prompts.",
+    )
+    _add_inspect_handoff_arguments(inspect_parser)
     return parser
 
 
@@ -266,6 +274,22 @@ def _add_handoff_summary_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Iteration log, iteration artifact, or BatonLoop log directory to summarize."
         ),
+    )
+
+
+def _add_inspect_handoff_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("log_dir", help="BatonLoop log directory to inspect.")
+    parser.add_argument(
+        "--iterations",
+        nargs="+",
+        type=parse_positive_int,
+        help="Iteration numbers to inspect. Defaults to all iterations with metadata.",
+    )
+    parser.add_argument(
+        "--first",
+        type=parse_positive_int,
+        default=3,
+        help="Number of initial progress messages and tasks to show per iteration.",
     )
 
 
@@ -285,8 +309,209 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(resume_context.previous_handoff_summary or "<no summary>")
         return 0
 
+    if args.command == "inspect-handoff":
+        try:
+            return _inspect_handoff_command(args)
+        except (FileNotFoundError, ValueError) as exc:
+            parser.exit(status=1, message=f"ERROR: {exc}\n")
+
     try:
         config = build_config(args)
         return run_loop(config, PROVIDERS)
     except (FileNotFoundError, ValueError) as exc:
         parser.exit(status=1, message=f"ERROR: {exc}\n")
+
+
+def _inspect_handoff_command(args: argparse.Namespace) -> int:
+    log_dir = resolve_path(Path(args.log_dir).expanduser(), Path.cwd())
+    if not log_dir.is_dir():
+        raise FileNotFoundError(f"Handoff log directory not found: {log_dir}")
+
+    iterations = (
+        tuple(args.iterations)
+        if args.iterations
+        else _discover_metadata_iterations(log_dir)
+    )
+    if not iterations:
+        print(f"No iteration metadata found in {log_dir}")
+        return 0
+
+    for index, iteration_number in enumerate(iterations):
+        if index:
+            print()
+        _print_iteration_inspection(
+            log_dir=log_dir,
+            iteration_number=iteration_number,
+            first_count=args.first,
+        )
+
+    return 0
+
+
+def _discover_metadata_iterations(log_dir: Path) -> tuple[int, ...]:
+    iteration_numbers: list[int] = []
+    for path in log_dir.glob("iteration-*.meta.json"):
+        try:
+            iteration_numbers.append(
+                int(path.name.removeprefix("iteration-").removesuffix(".meta.json"))
+            )
+        except ValueError:
+            continue
+    return tuple(sorted(iteration_numbers))
+
+
+def _print_iteration_inspection(
+    *,
+    log_dir: Path,
+    iteration_number: int,
+    first_count: int,
+) -> None:
+    log_path = log_dir / f"iteration-{iteration_number:06d}.json"
+    metadata_path = log_dir / f"iteration-{iteration_number:06d}.meta.json"
+    previous_metadata_path = log_dir / f"iteration-{iteration_number - 1:06d}.meta.json"
+    metadata = _load_json_object(metadata_path)
+    previous_metadata = _load_json_object(previous_metadata_path)
+
+    print(f"Iteration {iteration_number:06d}")
+    if metadata is None:
+        print("Metadata: missing")
+        return
+
+    if previous_metadata is not None:
+        print("Previous iteration summary:")
+        print(_indent(previous_metadata.get("handoff_summary") or "<none>"))
+
+    prompt_artifact_path = prompt_artifact_path_for(log_path)
+    input_prompt_path = _string_value(metadata.get("input_prompt_path"))
+    base_prompt_path = _string_value(metadata.get("base_prompt_path"))
+    generated_prompt = (
+        input_prompt_path == str(prompt_artifact_path) and prompt_artifact_path.is_file()
+    )
+    print(f"Generated prompt artifact: {'yes' if generated_prompt else 'no'}")
+    print(f"Input prompt: {input_prompt_path or '<missing>'}")
+    resume_source_log = _string_value(metadata.get("resume_source_log_path")) or "none"
+    print(f"Resume source log: {resume_source_log}")
+    print(
+        "Resume source metadata: "
+        f"{_string_value(metadata.get('resume_source_metadata_path')) or 'none'}"
+    )
+
+    if (
+        previous_metadata is not None
+        and previous_metadata.get("success") is False
+        and input_prompt_path == base_prompt_path
+    ):
+        print(
+            "WARNING: previous iteration failed but this iteration used "
+            "the base prompt directly."
+        )
+
+    progress_messages, tasks = _extract_iteration_start(log_path, first_count)
+    print(f"First {first_count} progress message(s):")
+    print(_indent("\n".join(progress_messages) if progress_messages else "<none>"))
+    print(f"First {first_count} task/tool call(s):")
+    print(_indent("\n".join(tasks) if tasks else "<none>"))
+
+
+def _load_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_iteration_start(
+    log_path: Path,
+    limit: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    progress_messages: list[str] = []
+    tasks: list[str] = []
+
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                if len(progress_messages) >= limit and len(tasks) >= limit:
+                    break
+                try:
+                    payload = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    if len(progress_messages) < limit:
+                        progress_messages.extend(_progress_messages_from_payload(payload))
+                    if len(tasks) < limit:
+                        tasks.extend(_tasks_from_payload(payload))
+    except OSError:
+        return (), ()
+
+    return tuple(progress_messages[:limit]), tuple(tasks[:limit])
+
+
+def _progress_messages_from_payload(payload: dict[str, Any]) -> list[str]:
+    payload_type = payload.get("type")
+    if payload_type == "item.completed":
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = _clean_cli_text(item.get("text"))
+            return [text] if text else []
+
+    if payload_type != "assistant":
+        return []
+
+    message = payload.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return []
+    return _content_texts(message.get("content"))
+
+
+def _tasks_from_payload(payload: dict[str, Any]) -> list[str]:
+    if payload.get("type") == "system" and payload.get("subtype") == "task_started":
+        description = _clean_cli_text(payload.get("description"))
+        prompt = _clean_cli_text(payload.get("prompt"))
+        return [_join_task_parts(description, prompt)] if description or prompt else []
+
+    item = payload.get("item")
+    if isinstance(item, dict) and item.get("type") == "collab_tool_call":
+        tool = _clean_cli_text(item.get("tool"))
+        prompt = _clean_cli_text(item.get("prompt"))
+        return [_join_task_parts(tool, prompt)] if tool or prompt else []
+
+    return []
+
+
+def _content_texts(content: object) -> list[str]:
+    if isinstance(content, str):
+        text = _clean_cli_text(content)
+        return [text] if text else []
+    if not isinstance(content, list):
+        return []
+    texts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        text = _clean_cli_text(item.get("text"))
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _join_task_parts(description: str | None, prompt: str | None) -> str:
+    if description and prompt:
+        return f"{description}: {prompt}"
+    return description or prompt or ""
+
+
+def _clean_cli_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    return text or None
+
+
+def _string_value(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _indent(text: object) -> str:
+    return "\n".join(f"  {line}" for line in str(text).splitlines())

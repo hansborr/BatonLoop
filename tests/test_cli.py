@@ -89,6 +89,63 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exc.exception.code, 0)
         self.assertIn("handoff-summary", stdout.getvalue())
+        self.assertIn("inspect-handoff", stdout.getvalue())
+
+    def test_inspect_handoff_warns_when_retry_used_base_prompt(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            log_dir = temp_root / "logs"
+            log_dir.mkdir()
+            prompt_path = temp_root / "PROMPT.md"
+            prompt_path.write_text("prompt", encoding="utf-8")
+            (log_dir / "iteration-000001.json").write_text("boom", encoding="utf-8")
+            (log_dir / "iteration-000001.meta.json").write_text(
+                json.dumps(
+                    {
+                        "success": False,
+                        "handoff_summary": "Previous iteration summary:\n- Goal: Fix retry.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (log_dir / "iteration-000002.json").write_text(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "Starting from the base prompt.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (log_dir / "iteration-000002.meta.json").write_text(
+                json.dumps(
+                    {
+                        "success": True,
+                        "base_prompt_path": str(prompt_path),
+                        "input_prompt_path": str(prompt_path),
+                        "resume_source_log_path": None,
+                        "resume_source_metadata_path": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    ["inspect-handoff", str(log_dir), "--iterations", "2", "--first", "1"]
+                )
+
+            self.assertEqual(exit_code, 0)
+            output = stdout.getvalue()
+            self.assertIn("Iteration 000002", output)
+            self.assertIn("Goal: Fix retry.", output)
+            self.assertIn("Generated prompt artifact: no", output)
+            self.assertIn("WARNING: previous iteration failed", output)
+            self.assertIn("Starting from the base prompt.", output)
 
 
 if __name__ == "__main__":

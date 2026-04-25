@@ -488,6 +488,80 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("Goal: Phase 5.1 is the next recommended task.", summary)
             self.assertIn("Interruption: You've hit your usage limit.", summary)
 
+    def test_extract_handoff_summary_prefers_late_actionable_recovery_notes(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000004.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Now I have enough context. Let me start implementing.",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "system",
+                                "subtype": "task_started",
+                                "description": "Critical review of Phase 5.4",
+                                "prompt": "Review the uncommitted diff and flag correctness blockers.",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": (
+                                                "Reviewer flagged two blockers: guard "
+                                                "`useCastPlacement.dispatch` while `map.get` is "
+                                                "unresolved and clear template/target-pick mode "
+                                                "when the strip unwinds."
+                                            ),
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Now I'll apply the two fixes.",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="claude")
+
+            assert summary is not None
+            self.assertIn("Goal: Reviewer flagged two blockers:", summary)
+            self.assertIn("useCastPlacement.dispatch", summary)
+            self.assertIn("Last activity: Now I'll apply the two fixes.", summary)
+            self.assertNotIn("Goal: Now I have enough context.", summary)
+
     def test_failure_iteration_writes_metadata_for_future_resume(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
@@ -511,7 +585,106 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(metadata["resume_source_log_path"], None)
             self.assertEqual(metadata["failover_target_provider"], None)
             self.assertEqual(metadata["handoff_summary"], None)
+            self.assertEqual(metadata["last_progress_messages"], [])
+            self.assertEqual(metadata["last_tasks"], [])
+            self.assertEqual(metadata["last_interruption"], None)
+            self.assertEqual(metadata["retry_recommended_next_step"], None)
             self.assertIn("git_status", metadata)
+
+    def test_timeout_retry_injects_resume_context_into_next_attempt(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=2,
+                iteration_timeout_minutes=Decimal("0.001"),
+                max_consecutive_errors=5,
+            )
+            provider = SequencedCommandProvider(
+                (
+                    [sys.executable, "-c", "import time; time.sleep(1)"],
+                    [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+                )
+            )
+
+            exit_code = run_loop(config, {"fake": provider})
+
+            self.assertEqual(exit_code, 0)
+            second_iteration_log = config.log_dir / "iteration-000002.json"
+            second_prompt_artifact = prompt_artifact_path_for(second_iteration_log)
+            second_metadata = json.loads(
+                metadata_path_for(second_iteration_log).read_text(encoding="utf-8")
+            )
+            self.assertTrue(second_prompt_artifact.is_file())
+            self.assertEqual(
+                second_metadata["resume_source_log_path"],
+                str(config.log_dir / "iteration-000001.json"),
+            )
+            self.assertEqual(
+                second_metadata["resume_source_metadata_path"],
+                str(config.log_dir / "iteration-000001.meta.json"),
+            )
+            self.assertEqual(second_metadata["input_prompt_path"], str(second_prompt_artifact))
+            prompt_text = second_prompt_artifact.read_text(encoding="utf-8")
+            self.assertIn("=== BATONLOOP RESUME CONTEXT ===", prompt_text)
+            self.assertIn(
+                f"Previous raw log: {config.log_dir / 'iteration-000001.json'}",
+                prompt_text,
+            )
+            self.assertIn("Previous timed out: True", prompt_text)
+            self.assertIn("Previous failure summary: Iteration 1 timed out", prompt_text)
+
+    def test_retryable_failure_injects_resume_context_without_advancing_prompt(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=2,
+                max_consecutive_errors=5,
+                prompt_texts=("first prompt", "second prompt"),
+            )
+            provider = SequencedCommandProvider(
+                (
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json, sys; "
+                            "print(json.dumps({'type':'item.completed','item':"
+                            "{'type':'agent_message','text':'All tests pass. Now commit the work.'}})); "
+                            "sys.exit(1)"
+                        ),
+                    ],
+                    [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+                )
+            )
+
+            exit_code = run_loop(config, {"fake": provider})
+
+            self.assertEqual(exit_code, 0)
+            second_iteration_log = config.log_dir / "iteration-000002.json"
+            second_prompt_artifact = prompt_artifact_path_for(second_iteration_log)
+            self.assertTrue(second_prompt_artifact.is_file())
+            prompt_text = second_prompt_artifact.read_text(encoding="utf-8")
+            self.assertIn("first prompt", prompt_text)
+            self.assertNotIn("second prompt", prompt_text)
+            self.assertIn("=== BATONLOOP RESUME CONTEXT ===", prompt_text)
+            self.assertIn(
+                f"Previous raw log: {config.log_dir / 'iteration-000001.json'}",
+                prompt_text,
+            )
+            self.assertIn("Previous exit code: 1", prompt_text)
+            self.assertIn("Goal: All tests pass. Now commit the work.", prompt_text)
+
+            second_metadata = json.loads(
+                metadata_path_for(second_iteration_log).read_text(encoding="utf-8")
+            )
+            self.assertEqual(second_metadata["base_prompt_path"], str(config.prompt_sequence[0]))
+            self.assertEqual(second_metadata["input_prompt_path"], str(second_prompt_artifact))
+            self.assertEqual(
+                second_metadata["resume_source_log_path"],
+                str(config.log_dir / "iteration-000001.json"),
+            )
 
     def test_failed_iterations_count_toward_iteration_limit(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -846,6 +1019,26 @@ class StaticCommandProvider:
         return FailureDecision(message=f"process failed with exit code {exit_code}")
 
 
+class SequencedCommandProvider(StaticCommandProvider):
+    def __init__(
+        self,
+        commands: tuple[list[str], ...],
+        *,
+        failure_decision: FailureDecision | None = None,
+    ) -> None:
+        if not commands:
+            raise ValueError("commands may not be empty")
+        super().__init__(commands[0], failure_decision=failure_decision)
+        self._commands = commands
+        self._next_command_index = 0
+
+    def build_command(self, config: RunnerConfig, execution: ProviderExecution) -> list[str]:
+        del config, execution
+        index = min(self._next_command_index, len(self._commands) - 1)
+        self._next_command_index += 1
+        return self._commands[index]
+
+
 class RateLimitedProvider:
     name = "limited"
 
@@ -936,9 +1129,13 @@ def _make_config(
     retry_backoff_max_seconds: int = 0,
     retry_jitter_fraction: Decimal = Decimal("0"),
     provider_cooldown_seconds: int = 0,
+    prompt_texts: tuple[str, ...] = ("prompt",),
 ) -> RunnerConfig:
-    prompt_path = temp_root / "PROMPT.md"
-    prompt_path.write_text("prompt", encoding="utf-8")
+    prompt_paths: list[Path] = []
+    for index, prompt_text in enumerate(prompt_texts):
+        prompt_path = temp_root / ("PROMPT.md" if index == 0 else f"PROMPT-{index + 1}.md")
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+        prompt_paths.append(prompt_path)
     return RunnerConfig(
         working_dir=temp_root,
         run_config_path=None,
@@ -946,8 +1143,8 @@ def _make_config(
         provider_profiles=provider_profiles or {},
         provider_config_path=None,
         default_provider_profile=ProviderProfile(),
-        prompt_specs=(PromptSpec(path=prompt_path, repeat=1),),
-        prompt_sequence=(prompt_path,),
+        prompt_specs=tuple(PromptSpec(path=prompt_path, repeat=1) for prompt_path in prompt_paths),
+        prompt_sequence=tuple(prompt_paths),
         max_iterations=max_iterations,
         max_cost=Decimal("0"),
         max_duration_hours=Decimal("0"),

@@ -47,6 +47,15 @@ class ResumeContext:
 
 
 @dataclass(frozen=True, slots=True)
+class HandoffDetails:
+    summary: str | None
+    last_progress_messages: tuple[str, ...]
+    last_tasks: tuple[str, ...]
+    last_interruption: str | None
+    retry_recommended_next_step: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _TaskSnapshot:
     description: str | None
     prompt: str | None
@@ -134,7 +143,7 @@ def write_iteration_metadata(
     resume_context: ResumeContext | None,
     resume_note: str | None,
 ) -> None:
-    handoff_summary = extract_handoff_summary(log_path, provider_hint=execution.name)
+    handoff_details = extract_handoff_details(log_path, provider_hint=execution.name)
     payload = {
         "version": 1,
         "provider_name": execution.name,
@@ -155,15 +164,21 @@ def write_iteration_metadata(
         "iteration_cost_usd": _decimal_to_string(iteration_cost),
         "failure_message": failure_message,
         "stop_reason": stop_reason,
-        "handoff_summary": handoff_summary,
+        "handoff_summary": handoff_details.summary,
         "failover_target_provider": failover_target_provider,
-        "resume_source_log_path": str(resume_context.source_log_path) if resume_context else None,
+        "resume_source_log_path": (
+            str(resume_context.source_log_path) if resume_context else None
+        ),
         "resume_source_metadata_path": (
             str(resume_context.source_metadata_path)
             if resume_context and resume_context.source_metadata_path is not None
             else None
         ),
         "resume_note": resume_note,
+        "last_progress_messages": list(handoff_details.last_progress_messages),
+        "last_tasks": list(handoff_details.last_tasks),
+        "last_interruption": handoff_details.last_interruption,
+        "retry_recommended_next_step": handoff_details.retry_recommended_next_step,
         "git_status": list(get_git_status_snapshot(working_dir, log_dir)),
     }
     metadata_path_for(log_path).write_text(
@@ -225,6 +240,14 @@ def extract_handoff_summary(
     *,
     provider_hint: str | None = None,
 ) -> str | None:
+    return extract_handoff_details(log_path, provider_hint=provider_hint).summary
+
+
+def extract_handoff_details(
+    log_path: Path,
+    *,
+    provider_hint: str | None = None,
+) -> HandoffDetails:
     messages: list[str] = []
     fallback_user_messages: list[str] = []
     tasks: deque[_TaskSnapshot] = deque(maxlen=4)
@@ -283,15 +306,38 @@ def extract_handoff_summary(
                     interruption_message=interruption_message,
                 )
     except OSError:
-        return None
+        return HandoffDetails(
+            summary=None,
+            last_progress_messages=(),
+            last_tasks=(),
+            last_interruption=None,
+            retry_recommended_next_step=None,
+        )
 
-    return _render_handoff_summary(
+    message_pool = _dedupe_messages(messages) or _dedupe_messages(fallback_user_messages)
+    summary = _render_handoff_summary(
         messages=messages,
         fallback_user_messages=fallback_user_messages,
         tasks=tuple(tasks),
         todo_snapshot=todo_snapshot,
         interruption_message=interruption_message,
         provider_hint=provider_hint,
+    )
+    return HandoffDetails(
+        summary=summary,
+        last_progress_messages=tuple(
+            text
+            for message in message_pool[-5:]
+            if (text := _truncate_text(message, max_chars=_MAX_TEXT_SNIPPET_CHARS))
+            is not None
+        ),
+        last_tasks=_render_task_summaries(tuple(tasks)),
+        last_interruption=interruption_message,
+        retry_recommended_next_step=_pick_retry_next_step(
+            message_pool=message_pool,
+            tasks=tuple(tasks),
+            todo_snapshot=todo_snapshot,
+        ),
     )
 
 
@@ -680,10 +726,13 @@ def _render_handoff_summary(
     if task_line:
         lines.append(f"- In-flight task: {task_line}")
 
-    if task_line is None:
-        last_activity = _pick_last_activity(message_pool)
-        if last_activity and last_activity not in {goal, checkpoint}:
-            lines.append(f"- Last activity: {last_activity}")
+    last_activity = _pick_last_activity(message_pool)
+    if (
+        last_activity
+        and last_activity not in {goal, checkpoint}
+        and (task_line is None or _is_actionable_recovery_message(last_activity))
+    ):
+        lines.append(f"- Last activity: {last_activity}")
 
     if interruption_message:
         lines.append(f"- Interruption: {interruption_message}")
@@ -699,15 +748,26 @@ def _pick_goal_message(messages: list[str]) -> str | None:
     if not messages:
         return None
 
-    window = messages[: min(8, len(messages))]
     best_index = 0
     best_score = float("-inf")
-    for index, text in enumerate(window):
-        score = _score_goal_message(text) - (index * 0.35)
+    last_index = len(messages) - 1
+    for index, text in enumerate(messages):
+        score = _score_goal_message(text)
+        if index <= 7:
+            score -= index * 0.25
+        else:
+            score -= 2.0
+        if index >= max(0, last_index - 5):
+            score += 1.5
+        if _is_actionable_recovery_message(text):
+            score += 8.0
+            score += min(index, 20) * 0.12
+        if _is_generic_context_progress_message(text):
+            score -= 6.0
         if score > best_score:
             best_score = score
             best_index = index
-    return _truncate_text(window[best_index], max_chars=_MAX_TEXT_SNIPPET_CHARS)
+    return _truncate_text(messages[best_index], max_chars=_MAX_TEXT_SNIPPET_CHARS)
 
 
 def _pick_verification_checkpoint(messages: list[str]) -> str | None:
@@ -762,6 +822,38 @@ def _render_task_summary(tasks: tuple[_TaskSnapshot, ...]) -> str | None:
     return None
 
 
+def _render_task_summaries(tasks: tuple[_TaskSnapshot, ...]) -> tuple[str, ...]:
+    rendered: list[str] = []
+    for snapshot in tasks[-5:]:
+        summary = _render_task_summary((snapshot,))
+        if summary:
+            rendered.append(summary)
+    return tuple(rendered)
+
+
+def _pick_retry_next_step(
+    *,
+    message_pool: list[str],
+    tasks: tuple[_TaskSnapshot, ...],
+    todo_snapshot: _TodoSnapshot | None,
+) -> str | None:
+    if todo_snapshot is not None and todo_snapshot.pending_texts:
+        return _truncate_text(
+            todo_snapshot.pending_texts[0],
+            max_chars=_MAX_TEXT_SNIPPET_CHARS,
+        )
+
+    last_activity = _pick_last_activity(message_pool)
+    if last_activity is not None:
+        return last_activity
+
+    task_summary = _render_task_summary(tasks)
+    if task_summary is not None:
+        return task_summary
+
+    return None
+
+
 def _compact_task_prompt(prompt: str | None) -> str | None:
     if not prompt:
         return None
@@ -811,6 +903,42 @@ def _score_goal_message(text: str) -> float:
     if any(token in lowered for token in ("checking the repo state", "reading", "let me explore")):
         score -= 1
     return score
+
+
+def _is_actionable_recovery_message(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        token in lowered
+        for token in (
+            "reviewer flagged",
+            "review flagged",
+            "flagged two",
+            "blocker",
+            "commit failed",
+            "failed to commit",
+            "now i'll apply",
+            "now i will apply",
+            "apply the fix",
+            "apply the two fixes",
+            "wait for git commit",
+            "all tests pass. now commit",
+            "all verification passes. now commit",
+        )
+    )
+
+
+def _is_generic_context_progress_message(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        token in lowered
+        for token in (
+            "now i have enough context. let me start implementing",
+            "now i have enough context. let me start the implementation",
+            "now i have a complete picture. let me start implementing",
+            "now i have a complete picture. let me start the implementation",
+            "now i have what i need. let me create",
+        )
+    )
 
 
 def _is_interruption_text(text: str) -> bool:
