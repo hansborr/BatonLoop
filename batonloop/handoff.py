@@ -103,6 +103,11 @@ def resolve_resume_context(path: Path) -> ResumeContext:
         previous_retry_recommended_next_step = (
             handoff_details.retry_recommended_next_step
         )
+        if metadata is not None:
+            metadata["handoff_extractor_version"] = _HANDOFF_EXTRACTOR_VERSION
+            metadata["handoff_summary"] = previous_handoff_summary
+            metadata["retry_recommended_next_step"] = previous_retry_recommended_next_step
+            _write_metadata(source_metadata_path, metadata)
 
     return ResumeContext(
         source_log_path=source_log_path,
@@ -461,6 +466,16 @@ def _load_metadata(path: Path) -> dict[str, object] | None:
     if isinstance(payload, dict):
         return payload
     return None
+
+
+def _write_metadata(path: Path, payload: dict[str, object]) -> None:
+    try:
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def _load_whole_log_payloads(text: str) -> tuple[dict[str, object], ...] | None:
@@ -978,7 +993,6 @@ def _is_terminal_state_message(text: str) -> bool:
             r"\b(is|are|was|were) shipped\b",
             r"\bshipped and committed\b",
             r"\b(is|are|was|were) committed\b",
-            r"\bcommitted\b",
             r"\b(is|are|was|were) implemented\b",
             r"\bimplemented and committed\b",
             r"\b(is|are|was|were) landed\b",
@@ -1020,8 +1034,6 @@ def _recovery_message_priority(text: str) -> float:
         )
     ):
         return 3.0
-    if any(token in lowered for token in ("apply", "fix")):
-        return 1.0
     return 2.0
 
 
@@ -1075,11 +1087,6 @@ def _is_generic_context_progress_message(text: str) -> bool:
             "now i have the complete picture",
             "now i have a complete picture",
             "now i have what i need",
-            "now i have enough context. let me start implementing",
-            "now i have enough context. let me start the implementation",
-            "now i have a complete picture. let me start implementing",
-            "now i have a complete picture. let me start the implementation",
-            "now i have what i need. let me create",
             "now let me check",
             "now let me read",
             "now let me open",

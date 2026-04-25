@@ -617,6 +617,25 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("State: Phase 5.3 is shipped and committed.", summary)
             self.assertNotIn("State: Now let me check", summary)
 
+    def test_extract_handoff_summary_does_not_treat_commit_intent_as_terminal(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000004.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        _agent_message("These changes must be committed before continuing."),
+                        _agent_message("Next task is update the regression tests."),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="codex")
+
+            assert summary is not None
+            self.assertIn("State: Next task is update the regression tests.", summary)
+            self.assertNotIn("State: These changes must be committed", summary)
+
     def test_extract_handoff_summary_selects_commit_failed_recovery_note(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             log_path = Path(tmp_dir) / "iteration-000005.json"
@@ -639,6 +658,24 @@ class RunnerTests(unittest.TestCase):
                 details.retry_recommended_next_step,
                 "The commit failed. Let me check the output.",
             )
+
+    def test_extract_handoff_summary_does_not_demote_apply_fix_recovery_note(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000006.json"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        _agent_message("The work is blocked on a small parser bug."),
+                        _agent_message("Now I'll apply the fix."),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="codex")
+
+            assert summary is not None
+            self.assertIn("State: Now I'll apply the fix.", summary)
 
     def test_extract_handoff_summary_avoids_complete_picture_for_rate_limit(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -714,6 +751,13 @@ class RunnerTests(unittest.TestCase):
                 context.previous_retry_recommended_next_step,
                 "Phase 8.1 is shipped and committed. Working tree is clean.",
             )
+            metadata = json.loads(metadata_path_for(log_path).read_text(encoding="utf-8"))
+            self.assertEqual(metadata["handoff_extractor_version"], 2)
+            self.assertEqual(
+                metadata["retry_recommended_next_step"],
+                "Phase 8.1 is shipped and committed. Working tree is clean.",
+            )
+            self.assertIn("State: Phase 8.1 is shipped and committed.", metadata["handoff_summary"])
 
     def test_resolve_resume_context_reuses_current_version_metadata(self) -> None:
         with TemporaryDirectory() as tmp_dir:
