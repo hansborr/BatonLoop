@@ -7,7 +7,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from batonloop.config import OutputFormat, build_config, parse_prompt_spec, resolve_provider_execution
+from batonloop.config import (
+    OutputFormat,
+    ProviderStrategy,
+    build_config,
+    parse_prompt_spec,
+    resolve_provider_execution,
+)
 
 
 class PromptSpecTests(unittest.TestCase):
@@ -163,6 +169,7 @@ class PromptSpecTests(unittest.TestCase):
                         "retry_backoff_max = 600",
                         'retry_jitter = "0.2"',
                         "provider_cooldown = 1800",
+                        'provider_strategy = "alternate"',
                         'checks = ["pytest -q"]',
                         "safe = true",
                         "",
@@ -189,6 +196,7 @@ class PromptSpecTests(unittest.TestCase):
             self.assertEqual(config.retry_backoff_max_seconds, 600)
             self.assertEqual(config.retry_jitter_fraction, Decimal("0.2"))
             self.assertEqual(config.provider_cooldown_seconds, 1800)
+            self.assertEqual(config.provider_strategy, ProviderStrategy.ALTERNATE)
             self.assertEqual(config.check_commands, ("pytest -q",))
             self.assertTrue(resolve_provider_execution(config, "claude").safe_mode)
             self.assertEqual(resolve_provider_execution(config, "codex").model, "gpt-5.4")
@@ -301,6 +309,7 @@ def _make_args(**overrides: object) -> Namespace:
         "retry_backoff_max_seconds": None,
         "retry_jitter_fraction": None,
         "provider_cooldown_seconds": None,
+        "provider_strategy": None,
         "max_consecutive_errors": None,
         "max_turns": None,
         "log_dir": None,

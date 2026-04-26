@@ -62,6 +62,7 @@ retry_backoff_multiplier = "2"
 retry_backoff_max = 600
 retry_jitter = "0.2"
 provider_cooldown = 1800
+provider_strategy = "failover"
 checks = ["pytest -q"]
 safe = true
 live_output = true
@@ -126,6 +127,7 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 - `codex` does not expose explicit cost data in the local JSON stream today, so cost tracking remains `0` unless the CLI starts emitting cost fields.
 - `copilot` does not expose explicit USD cost data in the current JSONL output, so cost tracking remains `0` unless the CLI starts emitting cost fields.
 - Repeat `--provider` to define failover order. BatonLoop keeps using the current provider until it hits an eligible failover condition or you stop the loop.
+- Set `provider_strategy = "alternate"` or pass `--provider-strategy alternate` to rotate to the next configured provider after each successful iteration. The default is `failover`.
 - `batonloop.toml` supports a `[run]` table for global loop settings. Common aliases match the CLI wording, such as `providers`, `prompt_files`, `iterations`, `pause`, `max_errors`, `checks`, `retry_backoff_base`, and `provider_cooldown`.
 - Retry policy is configurable. `--retry-backoff-base` enables exponential backoff for nonfatal failures, `--retry-backoff-max` caps it, `--retry-jitter` adds randomized +/- jitter, and provider-specific waits such as rate-limit waits still take precedence when they are longer.
 - `--provider-cooldown` keeps a provider out of failover rotation for the configured number of seconds after a failover-eligible failure. Failover wraps through the configured provider order and waits for the next cooling provider when no provider is immediately available.

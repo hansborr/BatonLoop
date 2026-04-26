@@ -10,6 +10,7 @@ from batonloop.config import (
     OutputFormat,
     PromptSpec,
     ProviderProfile,
+    ProviderStrategy,
     RunnerConfig,
     resolve_provider_execution,
 )
@@ -221,6 +222,7 @@ def _make_config(
         retry_backoff_max_seconds=0,
         retry_jitter_fraction=Decimal("0"),
         provider_cooldown_seconds=0,
+        provider_strategy=ProviderStrategy.FAILOVER,
         max_consecutive_errors=5,
         log_dir=temp_root / "logs",
         log_retain=0,

@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import (
     OutputFormat,
+    ProviderStrategy,
     build_config,
     parse_decimal_at_least_one,
     parse_fraction,
@@ -154,6 +155,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Seconds to keep a provider out of failover rotation after a failover-eligible "
             "failure. Use 0 to disable provider cooldowns."
+        ),
+    )
+    parser.add_argument(
+        "--provider-strategy",
+        choices=[strategy.value for strategy in ProviderStrategy],
+        default=None,
+        help=(
+            "Provider selection strategy: failover keeps using the current provider until "
+            "an eligible failure; alternate advances after each successful iteration."
         ),
     )
     parser.add_argument(

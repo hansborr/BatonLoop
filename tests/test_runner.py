@@ -16,6 +16,7 @@ from batonloop.config import (
     PromptSpec,
     ProviderExecution,
     ProviderProfile,
+    ProviderStrategy,
     RunnerConfig,
 )
 from batonloop.handoff import (
@@ -1112,6 +1113,33 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("Previous provider: limited", second_log_text)
             self.assertIn("Previous iteration summary:", second_log_text)
 
+    def test_alternate_provider_strategy_rotates_after_success(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=3,
+                provider_names=("one", "two"),
+                provider_strategy=ProviderStrategy.ALTERNATE,
+            )
+            providers = {
+                "one": StaticCommandProvider([sys.executable, "-c", "print('one')"]),
+                "two": StaticCommandProvider([sys.executable, "-c", "print('two')"]),
+            }
+
+            exit_code = run_loop(config, providers)
+
+            self.assertEqual(exit_code, 0)
+            provider_names = [
+                json.loads(
+                    metadata_path_for(
+                        config.log_dir / f"iteration-00000{index}.json"
+                    ).read_text(encoding="utf-8")
+                )["provider_name"]
+                for index in range(1, 4)
+            ]
+            self.assertEqual(provider_names, ["one", "two", "one"])
+
     def test_failover_respects_iteration_limit(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
@@ -1506,6 +1534,7 @@ def _make_config(
     retry_backoff_max_seconds: int = 0,
     retry_jitter_fraction: Decimal = Decimal("0"),
     provider_cooldown_seconds: int = 0,
+    provider_strategy: ProviderStrategy = ProviderStrategy.FAILOVER,
     prompt_texts: tuple[str, ...] = ("prompt",),
 ) -> RunnerConfig:
     prompt_paths: list[Path] = []
@@ -1533,6 +1562,7 @@ def _make_config(
         retry_backoff_max_seconds=retry_backoff_max_seconds,
         retry_jitter_fraction=retry_jitter_fraction,
         provider_cooldown_seconds=provider_cooldown_seconds,
+        provider_strategy=provider_strategy,
         max_consecutive_errors=max_consecutive_errors,
         log_dir=temp_root / "batonloop-logs",
         log_retain=0,

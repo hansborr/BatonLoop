@@ -15,7 +15,12 @@ from pathlib import Path
 from shutil import which
 from types import FrameType
 
-from .config import ProviderExecution, RunnerConfig, resolve_provider_execution
+from .config import (
+    ProviderExecution,
+    ProviderStrategy,
+    RunnerConfig,
+    resolve_provider_execution,
+)
 from .handoff import (
     ResumeContext,
     build_resume_prompt,
@@ -282,6 +287,17 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
             if outcome.should_break:
                 break
 
+            if (
+                outcome.success
+                and config.provider_strategy == ProviderStrategy.ALTERNATE
+                and len(provider_slots) > 1
+            ):
+                current_provider_index = (current_provider_index + 1) % len(provider_slots)
+                logger.info(
+                    "Provider strategy alternate: next iteration will use provider %s.",
+                    provider_slots[current_provider_index].execution.name,
+                )
+
             if outcome.wait_seconds > 0:
                 _interruptible_sleep(outcome.wait_seconds, controller)
                 if outcome.reset_error_count:
@@ -432,6 +448,7 @@ def _log_startup(
         _format_decimal(config.retry_jitter_fraction),
     )
     logger.info("Provider cooldown: %ss", config.provider_cooldown_seconds)
+    logger.info("Provider strategy: %s", config.provider_strategy.value)
     logger.info("Max errors:      %s", config.max_consecutive_errors)
     logger.info("Output format:   %s", config.output_format.value)
     logger.info("Live output:     %s", config.live_output)

@@ -15,6 +15,11 @@ class OutputFormat(StrEnum):
     JSON = "json"
 
 
+class ProviderStrategy(StrEnum):
+    FAILOVER = "failover"
+    ALTERNATE = "alternate"
+
+
 @dataclass(frozen=True, slots=True)
 class PromptSpec:
     path: Path
@@ -63,6 +68,7 @@ class RunnerConfig:
     retry_backoff_max_seconds: int
     retry_jitter_fraction: Decimal
     provider_cooldown_seconds: int
+    provider_strategy: ProviderStrategy
     max_consecutive_errors: int
     log_dir: Path
     log_retain: int
@@ -268,6 +274,13 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         run_settings.get("provider_cooldown_seconds"),
         0,
     )
+    provider_strategy = ProviderStrategy(
+        _coalesce(
+            getattr(args, "provider_strategy", None),
+            run_settings.get("provider_strategy"),
+            "failover",
+        )
+    )
     max_consecutive_errors = _coalesce(
         args.max_consecutive_errors,
         run_settings.get("max_consecutive_errors"),
@@ -325,6 +338,7 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         retry_backoff_max_seconds=retry_backoff_max_seconds,
         retry_jitter_fraction=retry_jitter_fraction,
         provider_cooldown_seconds=provider_cooldown_seconds,
+        provider_strategy=provider_strategy,
         max_consecutive_errors=max_consecutive_errors,
         log_dir=resolved_log_dir,
         log_retain=log_retain,
@@ -421,6 +435,7 @@ def _parse_run_settings(raw_settings: dict[str, Any], path: Path) -> dict[str, A
         "retry_jitter_fraction": "retry_jitter_fraction",
         "provider_cooldown": "provider_cooldown_seconds",
         "provider_cooldown_seconds": "provider_cooldown_seconds",
+        "provider_strategy": "provider_strategy",
         "max_errors": "max_consecutive_errors",
         "max_consecutive_errors": "max_consecutive_errors",
         "max_turns": "max_turns",
@@ -469,6 +484,7 @@ def _parse_run_setting_value(key: str, value: Any, path: Path) -> Any:
         "model",
         "log_dir",
         "output_format",
+        "provider_strategy",
         "resume_from",
         "resume_note",
     }:
