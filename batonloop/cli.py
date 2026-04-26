@@ -235,6 +235,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default non-bypass/sandboxed mode for providers without a profile-specific setting.",
     )
     parser.add_argument(
+        "--resume",
+        dest="resume_latest",
+        action="store_true",
+        default=None,
+        help=(
+            "Resume from the latest iteration in the configured log directory. "
+            "This appends generated handoff context to the next prompt."
+        ),
+    )
+    parser.add_argument(
         "--resume-from",
         help=(
             "Previous iteration log or BatonLoop log directory to resume from. "

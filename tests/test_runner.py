@@ -222,6 +222,101 @@ class RunnerTests(unittest.TestCase):
                 log_text,
             )
 
+    def test_resume_from_own_log_dir_continues_iteration_numbering(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            log_dir = temp_root / "batonloop-logs"
+            log_dir.mkdir()
+            previous_log = log_dir / "iteration-000003.json"
+            previous_log.write_text(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "Continue from the cancelled edit.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = _make_config(temp_root, max_iterations=1, resume_from=log_dir)
+            provider = StaticCommandProvider(
+                [sys.executable, "-c", "import sys; print(sys.stdin.read())"]
+            )
+
+            exit_code = run_loop(config, {"fake": provider})
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(previous_log.is_file())
+            self.assertFalse((log_dir / "iteration-000001.json").exists())
+            current_log = log_dir / "iteration-000004.json"
+            self.assertTrue(current_log.is_file())
+            log_text = current_log.read_text(encoding="utf-8")
+            self.assertIn(f"Previous raw log: {previous_log}", log_text)
+            self.assertIn("State: Continue from the cancelled edit.", log_text)
+
+    def test_resume_note_is_only_added_to_explicit_resume_attempt(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            previous_logs = temp_root / "previous-logs"
+            previous_logs.mkdir()
+            previous_log = previous_logs / "iteration-000001.json"
+            previous_log.write_text(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "Continue the cancelled provider run.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = _make_config(
+                temp_root,
+                max_iterations=2,
+                max_consecutive_errors=5,
+                resume_from=previous_logs,
+                resume_note="Previous iteration was force-cancelled.",
+            )
+            provider = SequencedCommandProvider(
+                (
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json, sys; "
+                            "print(json.dumps({'type':'item.completed','item':"
+                            "{'type':'agent_message','text':sys.stdin.read()}})); "
+                            "sys.exit(1)"
+                        ),
+                    ],
+                    [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+                )
+            )
+
+            exit_code = run_loop(config, {"fake": provider})
+
+            self.assertEqual(exit_code, 0)
+            first_prompt = prompt_artifact_path_for(config.log_dir / "iteration-000001.json")
+            second_prompt = prompt_artifact_path_for(config.log_dir / "iteration-000002.json")
+            self.assertIn(
+                "Operator note: Previous iteration was force-cancelled.",
+                first_prompt.read_text(encoding="utf-8"),
+            )
+            second_prompt_text = second_prompt.read_text(encoding="utf-8")
+            self.assertNotIn(
+                "Operator note: Previous iteration was force-cancelled.",
+                second_prompt_text,
+            )
+            self.assertNotIn("Previous iteration was force-cancelled.", second_prompt_text)
+            self.assertIn(
+                f"Previous raw log: {config.log_dir / 'iteration-000001.json'}",
+                second_prompt_text,
+            )
+
     def test_extract_handoff_summary_from_claude_log(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             log_path = Path(tmp_dir) / "iteration-000001.json"

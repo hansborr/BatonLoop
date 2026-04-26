@@ -32,6 +32,7 @@ python3 -m batonloop --provider codex -f ./PROMPT.md --iteration-timeout 20 --ch
 python3 -m batonloop --provider claude --provider codex -f ./PROMPT.md --retry-backoff-base 30 --retry-backoff-multiplier 2 --retry-backoff-max 600 --retry-jitter 0.2 --provider-cooldown 1800
 python3 -m batonloop --config ./batonloop.toml
 python3 -m batonloop -f ./PROMPT.md --stop-on-regex "DONE" --stop-when-file ./DONE.flag
+python3 -m batonloop --provider codex -f ./PROMPT.md --resume
 python3 -m batonloop --provider codex -f ./PROMPT.md --resume-from ./batonloop-logs --resume-note "Claude hit a usage limit; continue from the in-progress work."
 python3 -m batonloop handoff-summary ./batonloop-logs/iteration-000014.json
 ```
@@ -131,7 +132,9 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 - `--iterations` caps total provider-run attempts, including failed, timed-out, and auto-failover attempts. Prompt rotation still advances on successful iterations so interrupted work resumes the same prompt.
 - `--check` commands are run with the current shell and stop the loop when all configured checks pass.
 - `--stop-on-clean-git` ignores the configured log directory so BatonLoop's own log files do not keep the repo dirty.
+- `--resume` resumes from the latest iteration in the configured log directory. This is the easiest way to continue after force-cancelling a provider with a second `Ctrl+C`; BatonLoop writes the next iteration after the existing logs instead of overwriting them.
 - `--resume-from` accepts either an `iteration-*.json` log or a BatonLoop log directory. BatonLoop resolves that to a prior iteration, writes per-iteration `.meta.json` artifacts, extracts a compact summary from the prior log when possible, and appends a generated handoff block to each resumed prompt.
+- `--resume-note` is included only on the explicit resume handoff. If that resumed iteration fails and BatonLoop retries or fails over, the next handoff is generated from the newly failed iteration instead of reusing the same operator note forever.
 - `batonloop handoff-summary <path>` prints that extracted summary directly for a log, iteration artifact, or BatonLoop log directory.
 - Auto-failover reuses the same handoff mechanism internally: the failed iteration becomes the resume source for the next provider in the configured order.
 - The core loop no longer depends on `jq`, `bc`, or `setsid`.

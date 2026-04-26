@@ -108,6 +108,39 @@ class PromptSpecTests(unittest.TestCase):
                 ("--profile", "baton", "--sandbox", "workspace-write"),
             )
 
+    def test_resume_flag_uses_configured_log_dir(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            prompt_path = temp_root / "PROMPT.md"
+            prompt_path.write_text("develop", encoding="utf-8")
+
+            config = build_config(
+                _make_args(
+                    prompt_specs=[str(prompt_path)],
+                    log_dir=str(temp_root / "logs"),
+                    resume_latest=True,
+                )
+            )
+
+            self.assertEqual(config.log_dir, temp_root / "logs")
+            self.assertEqual(config.resume_from, temp_root / "logs")
+
+    def test_resume_flag_rejects_explicit_resume_from(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            prompt_path = temp_root / "PROMPT.md"
+            prompt_path.write_text("develop", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "--resume cannot be combined"):
+                build_config(
+                    _make_args(
+                        prompt_specs=[str(prompt_path)],
+                        log_dir=str(temp_root / "logs"),
+                        resume_latest=True,
+                        resume_from=str(temp_root / "old-logs"),
+                    )
+                )
+
     def test_build_config_loads_run_config_toml(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
@@ -281,6 +314,7 @@ def _make_args(**overrides: object) -> Namespace:
         "live_output": None,
         "bare": None,
         "safe": None,
+        "resume_latest": None,
         "resume_from": None,
         "resume_note": None,
         "dry_run": None,

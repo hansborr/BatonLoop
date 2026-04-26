@@ -204,11 +204,6 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         for raw_path in _coalesce(args.stop_when_files, run_settings.get("stop_when_files"), ())
     )
     resume_from_raw = _coalesce(args.resume_from, run_settings.get("resume_from"), None)
-    resume_from = (
-        resolve_path(Path(resume_from_raw).expanduser(), working_dir)
-        if resume_from_raw
-        else None
-    )
     provider_config_path = _resolve_provider_config_path(
         working_dir=working_dir,
         explicit_path=_coalesce(args.provider_config, run_settings.get("provider_config"), None),
@@ -280,6 +275,19 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
     )
     max_turns = _coalesce(args.max_turns, run_settings.get("max_turns"), None)
     log_dir = _coalesce(args.log_dir, run_settings.get("log_dir"), "./batonloop-logs")
+    resolved_log_dir = resolve_path(Path(log_dir).expanduser(), working_dir)
+    resume_latest = bool(getattr(args, "resume_latest", False))
+    if resume_latest and resume_from_raw:
+        raise ValueError("--resume cannot be combined with --resume-from or [run].resume_from.")
+    resume_from = (
+        resolved_log_dir
+        if resume_latest
+        else (
+            resolve_path(Path(resume_from_raw).expanduser(), working_dir)
+            if resume_from_raw
+            else None
+        )
+    )
     log_retain = _coalesce(args.log_retain, run_settings.get("log_retain"), 0)
     check_commands = tuple(_coalesce(args.check_commands, run_settings.get("check_commands"), ()))
     stop_on_clean_git = _coalesce(
@@ -318,7 +326,7 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         retry_jitter_fraction=retry_jitter_fraction,
         provider_cooldown_seconds=provider_cooldown_seconds,
         max_consecutive_errors=max_consecutive_errors,
-        log_dir=resolve_path(Path(log_dir).expanduser(), working_dir),
+        log_dir=resolved_log_dir,
         log_retain=log_retain,
         check_commands=check_commands,
         stop_on_regexes=stop_on_regexes,

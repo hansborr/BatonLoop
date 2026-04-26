@@ -167,6 +167,14 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
     resume_context = (
         resolve_resume_context(config.resume_from) if config.resume_from is not None else None
     )
+    iteration_number_offset = (
+        _latest_existing_iteration_number(config.log_dir)
+        if config.resume_from is not None and config.resume_from == config.log_dir
+        else 0
+    )
+    explicit_resume_source_log_path = (
+        resume_context.source_log_path if resume_context is not None else None
+    )
 
     logger = _configure_logger(config.log_dir / "batonloop.log")
     controller = StopController(logger)
@@ -198,7 +206,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 break
 
             state.attempted_iterations += 1
-            iteration_number = state.attempted_iterations
+            iteration_number = iteration_number_offset + state.attempted_iterations
             current_slot = provider_slots[current_provider_index]
             prompt_index = state.completed_iterations % len(config.prompt_sequence)
             current_prompt = config.prompt_sequence[prompt_index]
@@ -208,6 +216,15 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 exit_status = 1
                 break
 
+            iteration_resume_note = (
+                config.resume_note
+                if (
+                    resume_context is not None
+                    and explicit_resume_source_log_path is not None
+                    and resume_context.source_log_path == explicit_resume_source_log_path
+                )
+                else None
+            )
             iteration = _execute_iteration(
                 logger=logger,
                 config=config,
@@ -217,6 +234,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 prompt_index=prompt_index,
                 prompt_path=current_prompt,
                 resume_context=resume_context,
+                resume_note=iteration_resume_note,
             )
             outcome = _handle_iteration_outcome(
                 logger=logger,
@@ -245,7 +263,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 stop_reason=outcome.stop_reason,
                 failover_target_provider=outcome.failover_target_provider,
                 resume_context=resume_context,
-                resume_note=config.resume_note,
+                resume_note=iteration_resume_note,
             )
 
             if outcome.success:
@@ -485,6 +503,7 @@ def _execute_iteration(
     prompt_index: int,
     prompt_path: Path,
     resume_context: ResumeContext | None,
+    resume_note: str | None,
 ) -> IterationExecution:
     logger.info(
         "--- Iteration %s starting with provider %s ---",
@@ -506,6 +525,7 @@ def _execute_iteration(
         base_prompt_path=prompt_path,
         log_path=iteration_log,
         resume_context=resume_context,
+        resume_note=resume_note,
     )
     result = _run_iteration(
         provider=slot.provider,
@@ -838,6 +858,7 @@ def _prepare_iteration_prompt(
     base_prompt_path: Path,
     log_path: Path,
     resume_context: ResumeContext | None,
+    resume_note: str | None,
 ) -> Path:
     if resume_context is None:
         return base_prompt_path
@@ -848,7 +869,7 @@ def _prepare_iteration_prompt(
         working_dir=config.working_dir,
         log_dir=config.log_dir,
         resume_context=resume_context,
-        resume_note=config.resume_note,
+        resume_note=resume_note,
     )
     prompt_artifact_path = prompt_artifact_path_for(log_path)
     prompt_artifact_path.write_text(prompt_text, encoding="utf-8")
@@ -888,6 +909,16 @@ def _rotate_logs(log_dir: Path, retain: int) -> None:
                 path.unlink()
             except FileNotFoundError:
                 continue
+
+
+def _latest_existing_iteration_number(log_dir: Path) -> int:
+    latest = 0
+    for path in log_dir.iterdir():
+        match = _ITERATION_ARTIFACT_PATTERN.match(path.name)
+        if match is None:
+            continue
+        latest = max(latest, int(match.group(1)))
+    return latest
 
 
 def _evaluate_post_iteration_stop(

@@ -19,6 +19,8 @@ _MAX_SUMMARY_WORDS = 500
 _MAX_TEXT_SNIPPET_CHARS = 240
 _MAX_TASK_SNIPPET_CHARS = 320
 _HANDOFF_EXTRACTOR_VERSION = 2
+_RESUME_BLOCK_START = "=== BATONLOOP RESUME CONTEXT ==="
+_RESUME_BLOCK_END = "=== END BATONLOOP RESUME CONTEXT ==="
 _INTERRUPTION_PATTERNS = (
     "hit your limit",
     "usage limit",
@@ -419,6 +421,20 @@ def _render_resume_block(
     return "\n".join(lines)
 
 
+def _strip_resume_block(text: str) -> str | None:
+    start = text.find(_RESUME_BLOCK_START)
+    if start < 0:
+        return text
+
+    end = text.find(_RESUME_BLOCK_END, start)
+    if end < 0:
+        stripped = text[:start]
+    else:
+        stripped = text[:start] + text[end + len(_RESUME_BLOCK_END) :]
+
+    return _clean_optional_text(stripped)
+
+
 def _resolve_resume_log_path(path: Path) -> Path:
     if path.is_dir():
         return _latest_iteration_log(path)
@@ -529,7 +545,10 @@ def _consume_summary_payload(
     todo_snapshot: _TodoSnapshot | None,
     interruption_message: str | None,
 ) -> tuple[_TodoSnapshot | None, str | None]:
-    for text in _extract_progress_messages(payload):
+    for raw_text in _extract_progress_messages(payload):
+        text = _strip_resume_block(raw_text)
+        if text is None:
+            continue
         if _is_interruption_text(text):
             interruption_message = _clean_text(text)
             continue
@@ -597,7 +616,11 @@ def _extract_user_messages(payload: dict[str, object]) -> tuple[str, ...]:
     if not isinstance(message, dict) or message.get("role") != "user":
         return ()
 
-    return tuple(text for text in _iter_content_texts(message.get("content")) if text)
+    return tuple(
+        cleaned
+        for text in _iter_content_texts(message.get("content"))
+        if (cleaned := _strip_resume_block(text)) is not None
+    )
 
 
 def _extract_task_snapshot(payload: dict[str, object]) -> _TaskSnapshot | None:
