@@ -61,17 +61,74 @@ class RunnerTests(unittest.TestCase):
     def test_check_commands_stop_after_all_pass(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
+            ready_marker = temp_root / "ready"
             config = _make_config(
                 temp_root,
-                check_commands=(f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(0)'",),
+                check_commands=(f"test -f {shlex.quote(str(ready_marker))}",),
             )
             provider = StaticCommandProvider(
-                [sys.executable, "-c", "print('work complete')"],
+                [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(ready_marker)!r}).touch(); print('ready')",
+                ],
             )
 
             exit_code = run_loop(config, {"fake": provider})
 
             self.assertEqual(exit_code, 0)
+            self.assertTrue((config.log_dir / "preflight-check-01.log").is_file())
+            self.assertTrue((config.log_dir / "iteration-000001-check-01.log").is_file())
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
+            self.assertIn("All post-iteration checks passed", log_text)
+
+    def test_check_commands_stop_before_first_iteration_when_already_passing(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            provider_marker = temp_root / "provider-ran"
+            config = _make_config(
+                temp_root,
+                check_commands=(f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(0)'",),
+            )
+            provider = StaticCommandProvider(
+                [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(provider_marker)!r}).touch()",
+                ],
+            )
+
+            exit_code = run_loop(config, {"fake": provider})
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((config.log_dir / "preflight-check-01.log").is_file())
+            self.assertFalse((config.log_dir / "iteration-000001.json").exists())
+            self.assertFalse(provider_marker.exists())
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
+            self.assertIn("All initial checks passed before first iteration", log_text)
+
+    def test_check_commands_continue_to_first_iteration_when_initial_check_fails(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            ready_marker = temp_root / "ready"
+            config = _make_config(
+                temp_root,
+                max_iterations=1,
+                check_commands=(f"test -f {shlex.quote(str(ready_marker))}",),
+            )
+            provider = StaticCommandProvider(
+                [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(ready_marker)!r}).touch(); print('ready')",
+                ],
+            )
+
+            exit_code = run_loop(config, {"fake": provider})
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((config.log_dir / "preflight-check-01.log").is_file())
+            self.assertTrue((config.log_dir / "iteration-000001.json").is_file())
             self.assertTrue((config.log_dir / "iteration-000001-check-01.log").is_file())
             log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
             self.assertIn("All post-iteration checks passed", log_text)

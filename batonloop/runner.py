@@ -195,6 +195,14 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
             logger.info("Dry run - exiting.")
             return 0
 
+        if config.check_commands and _run_initial_checks(
+            logger=logger,
+            config=config,
+            controller=controller,
+        ):
+            logger.info("STOP: All initial checks passed before first iteration.")
+            return 0
+
         while True:
             if (
                 config.max_iterations
@@ -975,9 +983,38 @@ def _run_post_iteration_checks(
     controller: StopController,
     iteration: int,
 ) -> bool:
+    return _run_check_commands(
+        logger=logger,
+        config=config,
+        controller=controller,
+        log_stem=f"iteration-{iteration:06d}",
+    )
+
+
+def _run_initial_checks(
+    *,
+    logger: logging.Logger,
+    config: RunnerConfig,
+    controller: StopController,
+) -> bool:
+    return _run_check_commands(
+        logger=logger,
+        config=config,
+        controller=controller,
+        log_stem="preflight",
+    )
+
+
+def _run_check_commands(
+    *,
+    logger: logging.Logger,
+    config: RunnerConfig,
+    controller: StopController,
+    log_stem: str,
+) -> bool:
     all_checks_passed = True
     for index, command in enumerate(config.check_commands, start=1):
-        check_log = config.log_dir / f"iteration-{iteration:06d}-check-{index:02d}.log"
+        check_log = config.log_dir / f"{log_stem}-check-{index:02d}.log"
         logger.info("Running check [%s/%s]: %s", index, len(config.check_commands), command)
         result = _run_subprocess(
             command=command,
