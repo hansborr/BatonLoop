@@ -1170,6 +1170,46 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("Previous provider: limited", second_log_text)
             self.assertIn("Previous iteration summary:", second_log_text)
 
+    def test_terminal_error_stream_result_fails_over_when_process_lingers(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=2,
+                iteration_timeout_minutes=Decimal("0.02"),
+                provider_names=("limited", "backup"),
+                live_output=False,
+            )
+            limited_provider = HangingTerminalRateLimitedProvider()
+            providers = {
+                "limited": limited_provider,
+                "backup": ResumeEchoProvider(),
+            }
+
+            with patch(
+                "batonloop.runner._TERMINAL_STREAM_RESULT_GRACE_SECONDS",
+                0.1,
+            ):
+                exit_code = run_loop(config, providers)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(limited_provider.seen_exit_codes, [1])
+            first_iteration_metadata = json.loads(
+                metadata_path_for(config.log_dir / "iteration-000001.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(first_iteration_metadata["timed_out"])
+            self.assertEqual(first_iteration_metadata["exit_code"], 1)
+            self.assertEqual(first_iteration_metadata["failover_target_provider"], "backup")
+
+            log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
+            self.assertIn("AUTO FAILOVER: Switching provider from limited to backup.", log_text)
+            self.assertIn(
+                "terminated after a terminal stream result",
+                log_text,
+            )
+
     def test_alternate_provider_strategy_rotates_after_success(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             temp_root = Path(tmp_dir)
@@ -1523,6 +1563,45 @@ class RateLimitedProvider:
             skip_pause=True,
             should_failover=True,
         )
+
+
+class HangingTerminalRateLimitedProvider(RateLimitedProvider):
+    def __init__(self) -> None:
+        self.seen_exit_codes: list[int] = []
+
+    def build_command(self, config: RunnerConfig, execution: ProviderExecution) -> list[str]:
+        del config, execution
+        payload = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 429,
+            "result": "You've hit your session limit.",
+            "terminal_reason": "completed",
+        }
+        return [
+            sys.executable,
+            "-c",
+            (
+                "import json, subprocess, sys, time; "
+                "subprocess.Popen("
+                "[sys.executable, '-c', 'import time; time.sleep(5)'], "
+                "start_new_session=True"
+                "); "
+                f"print(json.dumps({payload!r}), flush=True); "
+                "time.sleep(30)"
+            ),
+        ]
+
+    def classify_failure(
+        self,
+        exit_code: int,
+        log_path: Path,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> FailureDecision:
+        self.seen_exit_codes.append(exit_code)
+        return super().classify_failure(exit_code, log_path, config, execution)
 
 
 class ResumeEchoProvider:

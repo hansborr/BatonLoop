@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -16,6 +17,7 @@ from shutil import which
 from types import FrameType
 
 from .config import (
+    OutputFormat,
     ProviderExecution,
     ProviderStrategy,
     RunnerConfig,
@@ -47,6 +49,7 @@ class RunState:
 class CommandResult:
     exit_code: int
     timed_out: bool = False
+    terminated_after_terminal_result: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,18 +84,25 @@ class IterationOutcome:
     next_provider_index: int | None = None
 
 
+_TERMINAL_STREAM_RESULT_GRACE_SECONDS = 1.0
+
+
 class _OutputPump(threading.Thread):
     def __init__(
         self,
         *,
         process: subprocess.Popen[bytes],
         log_handle: object,
-        consumer: LiveOutputConsumer,
+        consumer: LiveOutputConsumer | None,
+        detect_terminal_result: bool = False,
     ) -> None:
         super().__init__(daemon=True)
         self._process = process
         self._log_handle = log_handle
         self._consumer = consumer
+        self._detect_terminal_result = detect_terminal_result
+        self.terminal_result_seen = threading.Event()
+        self.terminal_result_exit_code: int | None = None
         self.error: BaseException | None = None
 
     def run(self) -> None:
@@ -107,7 +117,14 @@ class _OutputPump(threading.Thread):
                         break
                     self._log_handle.write(chunk)
                     self._log_handle.flush()
-                    self._consumer.consume_line(chunk.decode("utf-8", errors="replace"))
+                    line = chunk.decode("utf-8", errors="replace")
+                    if self._consumer is not None:
+                        self._consumer.consume_line(line)
+                    if self._detect_terminal_result:
+                        exit_code = _terminal_stream_result_exit_code(line)
+                        if exit_code is not None:
+                            self.terminal_result_exit_code = exit_code
+                            self.terminal_result_seen.set()
         except BaseException as exc:  # pragma: no cover - defensive thread handoff
             self.error = exc
 
@@ -561,6 +578,11 @@ def _execute_iteration(
         controller=controller,
     )
     logger.info("Exit code: %s", result.exit_code)
+    if result.terminated_after_terminal_result:
+        logger.info(
+            "Provider process was terminated after a terminal stream result "
+            "to clean up lingering child processes."
+        )
     return IterationExecution(
         number=iteration_number,
         slot=slot,
@@ -873,6 +895,7 @@ def _run_iteration(
             if config.live_output
             else None
         ),
+        detect_terminal_result=config.output_format is OutputFormat.STREAM_JSON,
     )
 
 
@@ -1067,6 +1090,7 @@ def _run_subprocess(
     shell: bool = False,
     timeout_seconds: float | None = None,
     live_output_consumer: LiveOutputConsumer | None = None,
+    detect_terminal_result: bool = False,
 ) -> CommandResult:
     popen_kwargs: dict[str, object] = {
         "stderr": subprocess.STDOUT,
@@ -1084,24 +1108,48 @@ def _run_subprocess(
             popen_kwargs["stdin"] = stdin_handle
 
         with log_path.open("wb") as log_handle:
-            if live_output_consumer is None:
+            stream_output = live_output_consumer is not None or detect_terminal_result
+            if not stream_output:
                 popen_kwargs["stdout"] = log_handle
             else:
                 popen_kwargs["stdout"] = subprocess.PIPE
             process = subprocess.Popen(command, **popen_kwargs)
             output_pump = None
-            if live_output_consumer is not None:
+            if stream_output:
                 output_pump = _OutputPump(
                     process=process,
                     log_handle=log_handle,
                     consumer=live_output_consumer,
+                    detect_terminal_result=detect_terminal_result,
                 )
                 output_pump.start()
             controller.attach_process(process)
             try:
                 started_at = time.monotonic()
+                terminal_result_seen_at: float | None = None
                 while True:
-                    wait_timeout = 1.0
+                    if (
+                        output_pump is not None
+                        and output_pump.terminal_result_seen.is_set()
+                    ):
+                        if terminal_result_seen_at is None:
+                            terminal_result_seen_at = time.monotonic()
+                        elif (
+                            time.monotonic() - terminal_result_seen_at
+                            >= _TERMINAL_STREAM_RESULT_GRACE_SECONDS
+                        ):
+                            _terminate_process_tree(process, force=False)
+                            process.wait()
+                            return CommandResult(
+                                exit_code=(
+                                    output_pump.terminal_result_exit_code
+                                    if output_pump.terminal_result_exit_code is not None
+                                    else process.returncode
+                                ),
+                                terminated_after_terminal_result=True,
+                            )
+
+                    wait_timeout = 0.1 if detect_terminal_result else 1.0
                     if timeout_seconds is not None:
                         remaining = timeout_seconds - (time.monotonic() - started_at)
                         if remaining <= 0:
@@ -1110,7 +1158,14 @@ def _run_subprocess(
                         wait_timeout = min(wait_timeout, remaining)
 
                     try:
-                        return CommandResult(exit_code=process.wait(timeout=wait_timeout))
+                        exit_code = process.wait(timeout=wait_timeout)
+                        if (
+                            output_pump is not None
+                            and output_pump.terminal_result_exit_code is not None
+                            and output_pump.terminal_result_exit_code != 0
+                        ):
+                            exit_code = output_pump.terminal_result_exit_code
+                        return CommandResult(exit_code=exit_code)
                     except subprocess.TimeoutExpired:
                         continue
             finally:
@@ -1122,6 +1177,20 @@ def _run_subprocess(
     finally:
         if stdin_handle is not None:
             stdin_handle.close()
+
+
+def _terminal_stream_result_exit_code(line: str) -> int | None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict) or payload.get("type") != "result":
+        return None
+
+    if payload.get("is_error") is True:
+        return 1
+    return 0
 
 
 def _terminate_process_tree(
@@ -1147,9 +1216,32 @@ def _terminate_process_tree(
 
 
 def _signal_process_tree(process: subprocess.Popen[bytes], signum: signal.Signals) -> None:
+    if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+        signaled = False
+        for process_group_id in _process_group_ids_for_tree(process.pid):
+            try:
+                os.killpg(process_group_id, signum)
+                signaled = True
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                if process_group_id != process.pid:
+                    continue
+                if signum is signal.SIGKILL:
+                    process.kill()
+                elif signum is signal.SIGTERM:
+                    process.terminate()
+                else:
+                    process.send_signal(signum)
+                signaled = True
+        if signaled:
+            return
+
     try:
-        if hasattr(os, "killpg"):
-            os.killpg(process.pid, signum)
+        if signum is signal.SIGKILL:
+            process.kill()
+        elif signum is signal.SIGTERM:
+            process.terminate()
         else:
             process.send_signal(signum)
     except ProcessLookupError:
@@ -1161,6 +1253,60 @@ def _signal_process_tree(process: subprocess.Popen[bytes], signum: signal.Signal
             process.terminate()
         else:
             process.send_signal(signum)
+
+
+def _process_group_ids_for_tree(root_pid: int) -> tuple[int, ...]:
+    descendant_pids = _descendant_pids(root_pid)
+    ordered_pids = [*sorted(descendant_pids, reverse=True), root_pid]
+    process_group_ids: list[int] = []
+    seen: set[int] = set()
+    for pid in ordered_pids:
+        try:
+            process_group_id = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        if process_group_id in seen:
+            continue
+        seen.add(process_group_id)
+        process_group_ids.append(process_group_id)
+
+    if process_group_ids:
+        return tuple(process_group_ids)
+    return (root_pid,)
+
+
+def _descendant_pids(root_pid: int) -> set[int]:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return set()
+
+    children_by_parent: dict[int, list[int]] = {}
+    for status_path in proc_root.glob("[0-9]*/status"):
+        try:
+            pid = int(status_path.parent.name)
+            parent_pid = _read_proc_status_parent_pid(status_path)
+        except (OSError, ValueError):
+            continue
+        if parent_pid is None:
+            continue
+        children_by_parent.setdefault(parent_pid, []).append(pid)
+
+    descendants: set[int] = set()
+    pending = list(children_by_parent.get(root_pid, ()))
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        pending.extend(children_by_parent.get(pid, ()))
+    return descendants
+
+
+def _read_proc_status_parent_pid(status_path: Path) -> int | None:
+    for line in status_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if line.startswith("PPid:"):
+            return int(line.split()[1])
+    return None
 
 
 def _timeout_seconds(config: RunnerConfig) -> float | None:
