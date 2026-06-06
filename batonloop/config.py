@@ -20,6 +20,11 @@ class ProviderStrategy(StrEnum):
     ALTERNATE = "alternate"
 
 
+class ProviderMode(StrEnum):
+    EXEC = "exec"
+    TMUX = "tmux"
+
+
 @dataclass(frozen=True, slots=True)
 class PromptSpec:
     path: Path
@@ -33,6 +38,7 @@ class ProviderProfile:
     max_turns: int | None = None
     use_bare: bool | None = None
     safe_mode: bool | None = None
+    mode: ProviderMode | None = None
     extra_args: tuple[str, ...] = ()
 
 
@@ -44,6 +50,7 @@ class ProviderExecution:
     max_turns: int | None
     use_bare: bool
     safe_mode: bool
+    mode: ProviderMode = ProviderMode.EXEC
     extra_args: tuple[str, ...] = ()
 
 
@@ -81,6 +88,7 @@ class RunnerConfig:
     resume_from: Path | None
     resume_note: str | None
     dry_run: bool
+    keep_tmux_sessions: bool = False
 
 
 def parse_prompt_spec(raw: str) -> PromptSpec:
@@ -183,6 +191,7 @@ def resolve_provider_execution(config: RunnerConfig, provider_name: str) -> Prov
         max_turns=_first_defined(profile.max_turns, defaults.max_turns),
         use_bare=_first_defined(profile.use_bare, defaults.use_bare, fallback=False),
         safe_mode=_first_defined(profile.safe_mode, defaults.safe_mode, fallback=False),
+        mode=_first_defined(profile.mode, defaults.mode, fallback=ProviderMode.EXEC),
         extra_args=defaults.extra_args + profile.extra_args,
     )
 
@@ -286,6 +295,13 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         run_settings.get("max_consecutive_errors"),
         5,
     )
+    provider_mode = ProviderMode(
+        _coalesce(
+            getattr(args, "provider_mode", None),
+            run_settings.get("provider_mode"),
+            ProviderMode.EXEC.value,
+        )
+    )
     max_turns = _coalesce(args.max_turns, run_settings.get("max_turns"), None)
     log_dir = _coalesce(args.log_dir, run_settings.get("log_dir"), "./batonloop-logs")
     resolved_log_dir = resolve_path(Path(log_dir).expanduser(), working_dir)
@@ -311,6 +327,11 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
     live_output = _coalesce(args.live_output, run_settings.get("live_output"), True)
     resume_note = _coalesce(args.resume_note, run_settings.get("resume_note"), None)
     dry_run = _coalesce(args.dry_run, run_settings.get("dry_run"), False)
+    keep_tmux_sessions = _coalesce(
+        getattr(args, "keep_tmux_sessions", None),
+        run_settings.get("keep_tmux_sessions"),
+        False,
+    )
 
     config = RunnerConfig(
         working_dir=working_dir,
@@ -324,6 +345,7 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
             max_turns=max_turns,
             use_bare=_coalesce(args.bare, run_settings.get("bare"), None),
             safe_mode=_coalesce(args.safe, run_settings.get("safe"), None),
+            mode=provider_mode,
         ),
         prompt_specs=prompt_specs,
         prompt_sequence=prompt_sequence,
@@ -351,6 +373,7 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         resume_from=resume_from,
         resume_note=resume_note or None,
         dry_run=dry_run,
+        keep_tmux_sessions=keep_tmux_sessions,
     )
 
     ensure_prompt_files_exist(config.prompt_sequence)
@@ -436,6 +459,7 @@ def _parse_run_settings(raw_settings: dict[str, Any], path: Path) -> dict[str, A
         "provider_cooldown": "provider_cooldown_seconds",
         "provider_cooldown_seconds": "provider_cooldown_seconds",
         "provider_strategy": "provider_strategy",
+        "provider_mode": "provider_mode",
         "max_errors": "max_consecutive_errors",
         "max_consecutive_errors": "max_consecutive_errors",
         "max_turns": "max_turns",
@@ -454,6 +478,7 @@ def _parse_run_settings(raw_settings: dict[str, Any], path: Path) -> dict[str, A
         "resume_from": "resume_from",
         "resume_note": "resume_note",
         "dry_run": "dry_run",
+        "keep_tmux_sessions": "keep_tmux_sessions",
     }
 
     parsed: dict[str, Any] = {}
@@ -485,6 +510,7 @@ def _parse_run_setting_value(key: str, value: Any, path: Path) -> Any:
         "log_dir",
         "output_format",
         "provider_strategy",
+        "provider_mode",
         "resume_from",
         "resume_note",
     }:
@@ -514,6 +540,7 @@ def _parse_run_setting_value(key: str, value: Any, path: Path) -> Any:
         "bare",
         "safe",
         "dry_run",
+        "keep_tmux_sessions",
     }:
         return _parse_bool(value, path, f"[run].{key}")
     raise AssertionError(f"Unhandled run config key: {key}")
@@ -632,7 +659,7 @@ def _parse_provider_profile(
     raw_profile: dict[str, Any],
     path: Path,
 ) -> ProviderProfile:
-    allowed_keys = {"binary", "model", "max_turns", "bare", "safe", "args"}
+    allowed_keys = {"binary", "model", "max_turns", "bare", "safe", "mode", "args"}
     unknown_keys = sorted(set(raw_profile) - allowed_keys)
     if unknown_keys:
         raise ValueError(
@@ -645,6 +672,7 @@ def _parse_provider_profile(
     max_turns = raw_profile.get("max_turns")
     use_bare = raw_profile.get("bare")
     safe_mode = raw_profile.get("safe")
+    mode = raw_profile.get("mode")
     extra_args = raw_profile.get("args")
 
     if binary is not None and not isinstance(binary, str):
@@ -668,6 +696,21 @@ def _parse_provider_profile(
         raise ValueError(
             f"Provider config {path} entry [providers.{provider_name}].safe must be a boolean."
         )
+    if mode is None:
+        parsed_mode = None
+    elif not isinstance(mode, str):
+        raise ValueError(
+            f"Provider config {path} entry [providers.{provider_name}].mode must be a string."
+        )
+    else:
+        try:
+            parsed_mode = ProviderMode(mode)
+        except ValueError as exc:
+            supported = ", ".join(item.value for item in ProviderMode)
+            raise ValueError(
+                f"Provider config {path} entry [providers.{provider_name}].mode must be "
+                f"one of: {supported}."
+            ) from exc
     if extra_args is None:
         parsed_extra_args: tuple[str, ...] = ()
     elif not isinstance(extra_args, list) or any(not isinstance(arg, str) for arg in extra_args):
@@ -684,6 +727,7 @@ def _parse_provider_profile(
         max_turns=max_turns,
         use_bare=use_bare,
         safe_mode=safe_mode,
+        mode=parsed_mode,
         extra_args=parsed_extra_args,
     )
 

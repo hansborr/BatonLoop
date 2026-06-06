@@ -4,7 +4,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-from ..config import OutputFormat, ProviderExecution, RunnerConfig
+from ..config import OutputFormat, ProviderExecution, ProviderMode, RunnerConfig
 from .base import FailureDecision, FailureKind
 from .utils import (
     decimal_from_value,
@@ -23,7 +23,30 @@ class ClaudeProvider:
         return execution.binary or self.default_binary
 
     def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
-        del config, execution
+        if execution.mode is ProviderMode.TMUX:
+            self.validate_interactive_config(config, execution)
+
+    def validate_interactive_config(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> None:
+        del config
+        if execution.max_turns is not None:
+            raise ValueError("Provider 'claude' does not support --max-turns in tmux mode.")
+        _reject_interactive_args(
+            provider_name=self.name,
+            args=execution.extra_args,
+            unsupported={
+                "-p",
+                "--print",
+                "--output-format",
+                "--input-format",
+                "--max-budget-usd",
+                "--max-turns",
+                "--no-session-persistence",
+            },
+        )
 
     def build_command(
         self,
@@ -55,6 +78,37 @@ class ClaudeProvider:
         command.extend(execution.extra_args)
 
         return command
+
+    def build_interactive_command(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> list[str]:
+        del config
+        command = [self.executable_name(execution)]
+
+        if not execution.safe_mode:
+            command.append("--dangerously-skip-permissions")
+
+        if execution.use_bare:
+            command.append("--bare")
+
+        if execution.model:
+            command.extend(["--model", execution.model])
+
+        command.extend(execution.extra_args)
+        return command
+
+    def interactive_environment(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> dict[str, str]:
+        del config, execution
+        return {
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
+            "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": "false",
+        }
 
     def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:
         if not log_path.is_file():
@@ -183,3 +237,17 @@ def _read_failure_summary(log_path: Path, output_format: OutputFormat):
         return summarize_failure_payloads(())
 
     return read_jsonl_failure_summary(log_path)
+
+
+def _reject_interactive_args(
+    *,
+    provider_name: str,
+    args: tuple[str, ...],
+    unsupported: set[str],
+) -> None:
+    for arg in args:
+        flag = arg.split("=", 1)[0]
+        if flag in unsupported:
+            raise ValueError(
+                f"Provider '{provider_name}' argument {arg!r} is not supported in tmux mode."
+            )

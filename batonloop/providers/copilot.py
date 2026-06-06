@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
-from ..config import OutputFormat, ProviderExecution, RunnerConfig
+from ..config import OutputFormat, ProviderExecution, ProviderMode, RunnerConfig
 from .base import FailureDecision, FailureKind
 from .utils import decimal_from_value, iter_jsonl, read_jsonl_failure_summary, read_log_text
 
@@ -16,12 +16,22 @@ class CopilotProvider:
         return execution.binary or self.default_binary
 
     def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
-        del execution
+        if execution.mode is ProviderMode.TMUX:
+            self.validate_interactive_config(config, execution)
+            return
         if config.output_format is not OutputFormat.STREAM_JSON:
             raise ValueError(
                 "Provider 'copilot' only supports BatonLoop stream-json mode, "
                 "which maps to 'copilot --output-format json'."
             )
+
+    def validate_interactive_config(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> None:
+        del config, execution
+        raise ValueError("Provider 'copilot' does not support tmux mode.")
 
     def build_command(
         self,
@@ -59,6 +69,22 @@ class CopilotProvider:
         command.extend(execution.extra_args)
 
         return command
+
+    def build_interactive_command(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> list[str]:
+        del config, execution
+        raise ValueError("Provider 'copilot' does not support tmux mode.")
+
+    def interactive_environment(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> dict[str, str]:
+        del config, execution
+        raise ValueError("Provider 'copilot' does not support tmux mode.")
 
     def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:
         del output_format

@@ -37,11 +37,32 @@ class Provider(Protocol):
     def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
         ...
 
+    def validate_interactive_config(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> None:
+        ...
+
     def build_command(
         self,
         config: RunnerConfig,
         execution: ProviderExecution,
     ) -> list[str]:
+        ...
+
+    def build_interactive_command(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> list[str]:
+        ...
+
+    def interactive_environment(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> dict[str, str]:
         ...
 
     def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:

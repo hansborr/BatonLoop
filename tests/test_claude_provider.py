@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 
 from batonloop.config import (
     OutputFormat,
+    ProviderMode,
     PromptSpec,
     ProviderProfile,
     ProviderStrategy,
@@ -69,6 +70,56 @@ class ClaudeProviderTests(unittest.TestCase):
                 "custom-value",
             ],
         )
+
+    def test_build_interactive_command_uses_claude_tui_flags(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            config = _make_config(
+                Path(tmp_dir),
+                mode=ProviderMode.TMUX,
+                max_turns=None,
+                extra_args=("--theme", "dark"),
+            )
+            execution = resolve_provider_execution(config, "claude")
+            command = self.provider.build_interactive_command(config, execution)
+            environment = self.provider.interactive_environment(config, execution)
+
+        self.assertEqual(
+            command,
+            [
+                "claude",
+                "--dangerously-skip-permissions",
+                "--model",
+                "sonnet",
+                "--theme",
+                "dark",
+            ],
+        )
+        self.assertEqual(environment["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"], "1")
+
+    def test_validate_interactive_config_rejects_print_mode_options(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            turn_limited_config = _make_config(
+                Path(tmp_dir),
+                mode=ProviderMode.TMUX,
+                max_turns=7,
+            )
+            with self.assertRaisesRegex(ValueError, "tmux mode"):
+                self.provider.validate_config(
+                    turn_limited_config,
+                    resolve_provider_execution(turn_limited_config, "claude"),
+                )
+
+            print_arg_config = _make_config(
+                Path(tmp_dir),
+                mode=ProviderMode.TMUX,
+                max_turns=None,
+                extra_args=("--output-format", "json"),
+            )
+            with self.assertRaisesRegex(ValueError, "not supported in tmux mode"):
+                self.provider.validate_config(
+                    print_arg_config,
+                    resolve_provider_execution(print_arg_config, "claude"),
+                )
 
     def test_extract_cost_from_stream_json_log(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -214,6 +265,8 @@ def _make_config(
     *,
     output_format: OutputFormat = OutputFormat.STREAM_JSON,
     extra_args: tuple[str, ...] = (),
+    mode: ProviderMode = ProviderMode.EXEC,
+    max_turns: int | None = 7,
 ) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
@@ -224,7 +277,8 @@ def _make_config(
         provider_profiles={
             "claude": ProviderProfile(
                 model="sonnet",
-                max_turns=7,
+                max_turns=max_turns,
+                mode=mode,
                 extra_args=extra_args,
             )
         },

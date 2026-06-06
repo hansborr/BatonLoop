@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .config import ProviderExecution
 
 
-_ITERATION_LOG_FILENAME = re.compile(r"^(iteration-\d{6})\.json$")
+_ITERATION_LOG_FILENAME = re.compile(r"^(iteration-\d{6})\.(?:json|log)$")
 _ITERATION_ARTIFACT_STEM = re.compile(r"^(iteration-\d{6})(?:\..+)?$")
 _MAX_SUMMARY_WORDS = 500
 _MAX_TEXT_SNIPPET_CHARS = 240
@@ -157,6 +157,8 @@ def write_iteration_metadata(
     base_prompt_path: Path,
     input_prompt_path: Path,
     output_format: str,
+    provider_mode: str,
+    log_format: str,
     exit_code: int,
     timed_out: bool,
     success: bool,
@@ -166,6 +168,10 @@ def write_iteration_metadata(
     failover_target_provider: str | None,
     resume_context: ResumeContext | None,
     resume_note: str | None,
+    tmux_session_name: str | None = None,
+    tmux_pane_id: str | None = None,
+    tmux_raw_log_path: Path | None = None,
+    tmux_attach_command: str | None = None,
 ) -> None:
     handoff_details = extract_handoff_details(log_path, provider_hint=execution.name)
     payload = {
@@ -177,12 +183,14 @@ def write_iteration_metadata(
         "provider_max_turns": execution.max_turns,
         "provider_use_bare": execution.use_bare,
         "provider_safe_mode": execution.safe_mode,
+        "provider_mode": provider_mode,
         "working_dir": str(working_dir),
         "log_dir": str(log_dir),
         "log_path": str(log_path),
         "base_prompt_path": str(base_prompt_path),
         "input_prompt_path": str(input_prompt_path),
         "output_format": output_format,
+        "log_format": log_format,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "success": success,
@@ -204,6 +212,10 @@ def write_iteration_metadata(
         "last_tasks": list(handoff_details.last_tasks),
         "last_interruption": handoff_details.last_interruption,
         "retry_recommended_next_step": handoff_details.retry_recommended_next_step,
+        "tmux_session_name": tmux_session_name,
+        "tmux_pane_id": tmux_pane_id,
+        "tmux_raw_log_path": str(tmux_raw_log_path) if tmux_raw_log_path else None,
+        "tmux_attach_command": tmux_attach_command,
         "git_status": list(get_git_status_snapshot(working_dir, log_dir)),
     }
     metadata_path_for(log_path).write_text(
@@ -316,6 +328,11 @@ def extract_handoff_details(
                             break
                     if interruption_message is None and _is_interruption_text(line):
                         interruption_message = _clean_text(line)
+                    elif (
+                        log_path.suffix == ".log"
+                        and (text_line := _clean_interactive_log_line(line)) is not None
+                    ):
+                        fallback_user_messages.append(text_line)
                     continue
 
                 pending_payloads = _coerce_summary_payloads(payload)
@@ -452,12 +469,13 @@ def _resolve_resume_log_path(path: Path) -> Path:
             "Resume source must be an iteration log, an iteration artifact, or a BatonLoop log directory."
         )
 
-    derived_log_path = path.with_name(f"{stem_match.group(1)}.json")
-    if not derived_log_path.is_file():
-        raise FileNotFoundError(
-            f"Could not locate the raw iteration log for resume source: {path}"
-        )
-    return derived_log_path
+    for suffix in (".json", ".log"):
+        derived_log_path = path.with_name(f"{stem_match.group(1)}{suffix}")
+        if derived_log_path.is_file():
+            return derived_log_path
+    raise FileNotFoundError(
+        f"Could not locate the raw iteration log for resume source: {path}"
+    )
 
 
 def _latest_iteration_log(log_dir: Path) -> Path:
@@ -1130,6 +1148,33 @@ def _is_interruption_text(text: str) -> bool:
 
 def _is_generic_success_result_text(text: str) -> bool:
     return text.lower() in _GENERIC_SUCCESS_RESULTS
+
+
+def _clean_interactive_log_line(text: str) -> str | None:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    if cleaned.startswith("BATONLOOP_TURN_COMPLETE "):
+        return None
+    if "batonloop control" in lowered:
+        return None
+    if lowered in {
+        "/clear",
+        "=== end batonloop control ===",
+        "=== batonloop resume context ===",
+        "=== end batonloop resume context ===",
+    }:
+        return None
+    if lowered.startswith(
+        (
+            "when you are completely finished with this turn",
+            "do not emit that line until",
+        )
+    ):
+        return None
+    return cleaned
 
 
 def _clean_text(text: str) -> str:

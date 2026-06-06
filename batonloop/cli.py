@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import (
     OutputFormat,
+    ProviderMode,
     ProviderStrategy,
     build_config,
     parse_decimal_at_least_one,
@@ -167,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--provider-mode",
+        choices=[mode.value for mode in ProviderMode],
+        default=None,
+        help="Provider execution mode. Defaults to exec; tmux keeps an interactive provider session alive.",
+    )
+    parser.add_argument(
         "-e",
         "--max-errors",
         dest="max_consecutive_errors",
@@ -271,6 +278,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="Show config and exit.",
+    )
+    parser.add_argument(
+        "--keep-tmux-sessions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Keep private tmux sessions after BatonLoop exits for debugging.",
     )
     subparsers = parser.add_subparsers(dest="command")
     handoff_parser = subparsers.add_parser(
@@ -386,7 +399,6 @@ def _print_iteration_inspection(
     iteration_number: int,
     first_count: int,
 ) -> None:
-    log_path = log_dir / f"iteration-{iteration_number:06d}.json"
     metadata_path = log_dir / f"iteration-{iteration_number:06d}.meta.json"
     previous_metadata_path = log_dir / f"iteration-{iteration_number - 1:06d}.meta.json"
     metadata = _load_json_object(metadata_path)
@@ -396,6 +408,12 @@ def _print_iteration_inspection(
     if metadata is None:
         print("Metadata: missing")
         return
+
+    log_path = _resolve_iteration_log_path(
+        log_dir=log_dir,
+        iteration_number=iteration_number,
+        metadata=metadata,
+    )
 
     if previous_metadata is not None:
         print("Previous iteration summary:")
@@ -441,6 +459,26 @@ def _load_json_object(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _resolve_iteration_log_path(
+    *,
+    log_dir: Path,
+    iteration_number: int,
+    metadata: dict[str, Any],
+) -> Path:
+    metadata_log_path = _string_value(metadata.get("log_path"))
+    if metadata_log_path:
+        path = Path(metadata_log_path)
+        if path.is_file():
+            return path
+
+    for suffix in (".json", ".log"):
+        path = log_dir / f"iteration-{iteration_number:06d}{suffix}"
+        if path.is_file():
+            return path
+
+    return log_dir / f"iteration-{iteration_number:06d}.json"
+
+
 def _extract_iteration_start(
     log_path: Path,
     limit: int,
@@ -456,6 +494,10 @@ def _extract_iteration_start(
                 try:
                     payload = json.loads(raw_line)
                 except json.JSONDecodeError:
+                    if len(progress_messages) < limit:
+                        text = _clean_interactive_cli_line(raw_line)
+                        if text:
+                            progress_messages.append(text)
                     continue
                 if isinstance(payload, dict):
                     if len(progress_messages) < limit:
@@ -527,6 +569,23 @@ def _clean_cli_text(value: object) -> str | None:
         return None
     text = " ".join(value.split())
     return text or None
+
+
+def _clean_interactive_cli_line(value: str) -> str | None:
+    text = _clean_cli_text(value)
+    if not text:
+        return None
+    lowered = text.lower()
+    if text.startswith("BATONLOOP_TURN_COMPLETE ") or "batonloop control" in lowered:
+        return None
+    if lowered.startswith(
+        (
+            "when you are completely finished with this turn",
+            "do not emit that line until",
+        )
+    ):
+        return None
+    return text
 
 
 def _string_value(value: object) -> str | None:

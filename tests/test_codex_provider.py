@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 
 from batonloop.config import (
     OutputFormat,
+    ProviderMode,
     PromptSpec,
     ProviderProfile,
     ProviderStrategy,
@@ -95,6 +96,56 @@ class CodexProviderTests(unittest.TestCase):
                 "workspace-write",
             ],
         )
+
+    def test_build_interactive_command_uses_codex_tui_flags(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            config = _make_config(
+                Path(tmp_dir),
+                safe_mode=True,
+                mode=ProviderMode.TMUX,
+                extra_args=("--profile", "baton"),
+            )
+            execution = resolve_provider_execution(config, "codex")
+            command = self.provider.build_interactive_command(config, execution)
+
+        self.assertEqual(
+            command,
+            [
+                "codex",
+                "--no-alt-screen",
+                "-C",
+                str(config.working_dir),
+                "--full-auto",
+                "-m",
+                "gpt-5",
+                "--profile",
+                "baton",
+            ],
+        )
+
+    def test_validate_interactive_config_rejects_unmapped_bare_mode(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            bare_config = _make_config(
+                Path(tmp_dir),
+                mode=ProviderMode.TMUX,
+                use_bare=True,
+            )
+            with self.assertRaisesRegex(ValueError, "does not support bare mode"):
+                self.provider.validate_config(
+                    bare_config,
+                    resolve_provider_execution(bare_config, "codex"),
+                )
+
+            exec_arg_config = _make_config(
+                Path(tmp_dir),
+                mode=ProviderMode.TMUX,
+                extra_args=("--json",),
+            )
+            with self.assertRaisesRegex(ValueError, "not supported in tmux mode"):
+                self.provider.validate_config(
+                    exec_arg_config,
+                    resolve_provider_execution(exec_arg_config, "codex"),
+                )
 
     def test_validate_config_rejects_unsupported_options(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -191,6 +242,7 @@ def _make_config(
     output_format: OutputFormat = OutputFormat.STREAM_JSON,
     max_turns: int | None = None,
     extra_args: tuple[str, ...] = (),
+    mode: ProviderMode = ProviderMode.EXEC,
 ) -> RunnerConfig:
     prompt_path = temp_root / "PROMPT.md"
     prompt_path.write_text("prompt", encoding="utf-8")
@@ -204,6 +256,7 @@ def _make_config(
                 max_turns=max_turns,
                 use_bare=use_bare,
                 safe_mode=safe_mode,
+                mode=mode,
                 extra_args=extra_args,
             )
         },

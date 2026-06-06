@@ -11,6 +11,7 @@ This is a Python rewrite of the old `ralph.sh` loop runner. The first version ke
 - Claude provider adapter with command building, error classification, and cost extraction
 - Codex provider adapter with `codex exec` support and provider-specific validation
 - GitHub Copilot provider adapter with `copilot --output-format json --autopilot` support and provider-specific validation
+- Opt-in tmux-backed interactive mode for Claude and Codex providers
 - Automatic in-process failover across multiple providers on eligible failures such as rate limits
 - Configurable retry backoff, jitter, and provider cooldowns for long-running loops
 - Run settings loaded from `batonloop.toml`, with CLI flags overriding file values
@@ -29,6 +30,7 @@ python3 -m batonloop --provider copilot -f ./PROMPT.md
 python3 -m batonloop --provider codex -f ./PROMPT.md
 python3 -m batonloop --provider claude --provider codex --provider copilot -f ./PROMPT.md
 python3 -m batonloop --provider codex -f ./PROMPT.md --iteration-timeout 20 --check "pytest -q"
+python3 -m batonloop --provider codex --provider-mode tmux -f ./PROMPT.md --keep-tmux-sessions
 python3 -m batonloop --provider claude --provider codex -f ./PROMPT.md --retry-backoff-base 30 --retry-backoff-multiplier 2 --retry-backoff-max 600 --retry-jitter 0.2 --provider-cooldown 1800
 python3 -m batonloop --config ./batonloop.toml
 python3 -m batonloop -f ./PROMPT.md --stop-on-regex "DONE" --stop-when-file ./DONE.flag
@@ -63,12 +65,15 @@ retry_backoff_max = 600
 retry_jitter = "0.2"
 provider_cooldown = 1800
 provider_strategy = "failover"
+provider_mode = "exec"
 checks = ["pytest -q"]
 safe = true
 live_output = true
+keep_tmux_sessions = false
 
 [providers.claude]
 safe = true
+mode = "tmux"
 
 [providers.codex]
 safe = true
@@ -108,6 +113,7 @@ args = ["--effort", "high"]
 
 BatonLoop automatically loads that file when it exists. It also falls back to `./ralph-providers.toml` for compatibility. You can point at another file with `--provider-config`.
 The shared keys are `binary`, `model`, `max_turns`, `bare`, and `safe`. Use `args` for provider-owned CLI flags so new adapter options do not require changes to BatonLoop core config.
+Provider profiles also accept `mode = "exec"` or `mode = "tmux"`; `tmux` is currently supported for Claude and Codex only.
 
 When you run:
 
@@ -121,6 +127,9 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 
 - `codex` currently supports `stream-json` only; `--no-stream` is rejected for that provider.
 - `copilot` currently supports BatonLoop's default `stream-json` mode only; BatonLoop maps that to `copilot --output-format json`, so `--no-stream` is rejected for that provider.
+- `--provider-mode tmux` keeps a provider in a private detached tmux session, pastes prompts through tmux buffers, sends `/clear` between successful turns, waits for a BatonLoop completion marker, and writes `iteration-*.log` text logs plus `tmux-<provider>.raw.log`.
+- Tmux mode is opt-in because it does not provide structured provider JSON, stable cost extraction, or full filtered live-output parity. Cost is recorded as `0` for tmux iterations.
+- `--keep-tmux-sessions` leaves private tmux sessions running for debugging; otherwise BatonLoop kills them at shutdown. The BatonLoop log prints the attach command.
 - `copilot` maps BatonLoop's `max_turns` setting to `--max-autopilot-continues`.
 - `copilot` bare mode is best-effort today: BatonLoop disables custom instructions and built-in MCPs, but Copilot may still load other customizations that the CLI does not currently expose flags to disable.
 - Filtered live provider output is enabled by default for normal runs. Use `--no-live-output` to keep the console quiet while still writing the raw iteration log.
@@ -135,7 +144,7 @@ BatonLoop starts with Claude using the Claude profile and, if it hits an auto-fa
 - `--check` commands are run with the current shell and stop the loop when all configured checks pass.
 - `--stop-on-clean-git` ignores the configured log directory so BatonLoop's own log files do not keep the repo dirty.
 - `--resume` resumes from the latest iteration in the configured log directory. This is the easiest way to continue after force-cancelling a provider with a second `Ctrl+C`; BatonLoop writes the next iteration after the existing logs instead of overwriting them.
-- `--resume-from` accepts either an `iteration-*.json` log or a BatonLoop log directory. BatonLoop resolves that to a prior iteration, writes per-iteration `.meta.json` artifacts, extracts a compact summary from the prior log when possible, and appends a generated handoff block to each resumed prompt.
+- `--resume-from` accepts either an `iteration-*.json` or `iteration-*.log` log or a BatonLoop log directory. BatonLoop resolves that to a prior iteration, writes per-iteration `.meta.json` artifacts, extracts a compact summary from the prior log when possible, and appends a generated handoff block to each resumed prompt.
 - `--resume-note` is included only on the explicit resume handoff. If that resumed iteration fails and BatonLoop retries or fails over, the next handoff is generated from the newly failed iteration instead of reusing the same operator note forever.
 - `batonloop handoff-summary <path>` prints that extracted summary directly for a log, iteration artifact, or BatonLoop log directory.
 - Auto-failover reuses the same handoff mechanism internally: the failed iteration becomes the resume source for the next provider in the configured order.

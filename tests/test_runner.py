@@ -15,6 +15,7 @@ from batonloop.config import (
     OutputFormat,
     PromptSpec,
     ProviderExecution,
+    ProviderMode,
     ProviderProfile,
     ProviderStrategy,
     RunnerConfig,
@@ -37,6 +38,7 @@ from batonloop.runner import (
     _handle_iteration_outcome,
     run_loop,
 )
+from batonloop.tmux_session import TmuxTurnResult
 
 
 class RunnerTests(unittest.TestCase):
@@ -144,6 +146,50 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             log_text = (config.log_dir / "batonloop.log").read_text(encoding="utf-8")
             self.assertIn("Stop regex matched iteration output", log_text)
+
+    def test_tmux_mode_writes_text_logs_prompt_artifacts_and_metadata(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            config = _make_config(
+                temp_root,
+                max_iterations=2,
+                provider_profiles={
+                    "fake": ProviderProfile(mode=ProviderMode.TMUX),
+                },
+            )
+            FakeTmuxSessionManager.instances.clear()
+
+            with (
+                patch("batonloop.runner.TmuxSessionManager", FakeTmuxSessionManager),
+                patch("batonloop.runner._ensure_executable_available", lambda command: None),
+            ):
+                exit_code = run_loop(config, {"fake": InteractiveEchoProvider()})
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((config.log_dir / "iteration-000001.log").is_file())
+            self.assertTrue((config.log_dir / "iteration-000002.log").is_file())
+            self.assertFalse((config.log_dir / "iteration-000001.json").exists())
+            self.assertFalse((config.log_dir / "iteration-000002.json").exists())
+
+            prompt_artifact = config.log_dir / "iteration-000001.prompt.txt"
+            self.assertTrue(prompt_artifact.is_file())
+            prompt_text = prompt_artifact.read_text(encoding="utf-8")
+            self.assertIn("=== BATONLOOP CONTROL ===", prompt_text)
+            self.assertIn("BATONLOOP_TURN_COMPLETE", prompt_text)
+
+            metadata = json.loads(
+                (config.log_dir / "iteration-000001.meta.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["provider_mode"], "tmux")
+            self.assertEqual(metadata["log_format"], "text")
+            self.assertEqual(metadata["tmux_session_name"], "batonloop-fake-1")
+            self.assertEqual(metadata["tmux_pane_id"], "%1")
+            self.assertEqual(metadata["iteration_cost_usd"], "0")
+
+            self.assertEqual(len(FakeTmuxSessionManager.instances), 1)
+            fake_manager = FakeTmuxSessionManager.instances[0]
+            self.assertEqual(len(fake_manager.prompt_texts), 2)
+            self.assertEqual(fake_manager.close_keep_sessions, False)
 
     def test_stop_when_file_detects_marker(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -313,6 +359,25 @@ class RunnerTests(unittest.TestCase):
             log_text = current_log.read_text(encoding="utf-8")
             self.assertIn(f"Previous raw log: {previous_log}", log_text)
             self.assertIn("State: Continue from the cancelled edit.", log_text)
+
+    def test_resume_from_directory_accepts_latest_interactive_log(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            previous_logs = temp_root / "previous-logs"
+            previous_logs.mkdir()
+            older_log = previous_logs / "iteration-000001.json"
+            latest_log = previous_logs / "iteration-000002.log"
+            older_log.write_text(_agent_message("Older structured progress."), encoding="utf-8")
+            latest_log.write_text(
+                "Interactive provider finished the tmux implementation slice.\n",
+                encoding="utf-8",
+            )
+
+            resume_context = resolve_resume_context(previous_logs)
+
+            self.assertEqual(resume_context.source_log_path, latest_log)
+            assert resume_context.previous_handoff_summary is not None
+            self.assertIn("tmux implementation slice", resume_context.previous_handoff_summary)
 
     def test_resume_note_is_only_added_to_explicit_resume_attempt(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -494,6 +559,28 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("State: Phase 5.0 is the next recommended task.", summary)
             self.assertNotIn("Completed successfully", summary)
             self.assertNotIn("Interruption:", summary)
+
+    def test_extract_handoff_summary_from_interactive_text_log(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "iteration-000001.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "=== BATONLOOP CONTROL ===",
+                        "Working through the tmux session manager wiring.",
+                        "Tests pass. Next recommended task is documenting tmux mode.",
+                        "BATONLOOP_TURN_COMPLETE 1234",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = extract_handoff_summary(log_path, provider_hint="codex")
+
+            assert summary is not None
+            self.assertIn("Previous iteration summary:", summary)
+            self.assertIn("Next recommended task is documenting tmux mode.", summary)
+            self.assertNotIn("BATONLOOP_TURN_COMPLETE", summary)
 
     def test_extract_handoff_summary_from_claude_json_log(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -1636,6 +1723,72 @@ class ResumeEchoProvider:
     ) -> FailureDecision:
         del exit_code, log_path, config, execution
         return FailureDecision(message="unexpected failure")
+
+
+class InteractiveEchoProvider(StaticCommandProvider):
+    def __init__(self) -> None:
+        super().__init__([sys.executable, "-c", "print('unused')"])
+
+    def build_interactive_command(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> list[str]:
+        del config, execution
+        return [sys.executable, "-i"]
+
+    def interactive_environment(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> dict[str, str]:
+        del config, execution
+        return {}
+
+
+class FakeTmuxSessionManager:
+    instances: list["FakeTmuxSessionManager"] = []
+
+    def __init__(self, *, log_dir: Path) -> None:
+        self.log_dir = log_dir
+        self.prompt_texts: list[str] = []
+        self.close_keep_sessions: bool | None = None
+        self.raw_log_path = log_dir / "tmux-fake.raw.log"
+        self.raw_log_path.write_text("", encoding="utf-8")
+        self.instances.append(self)
+
+    def run_turn(
+        self,
+        *,
+        provider: object,
+        execution: ProviderExecution,
+        config: RunnerConfig,
+        prompt_path: Path,
+        log_path: Path,
+        completion_marker: str,
+        timeout_seconds: float | None,
+        logger: logging.Logger,
+    ) -> TmuxTurnResult:
+        del provider, config, timeout_seconds, logger
+        self.prompt_texts.append(prompt_path.read_text(encoding="utf-8"))
+        log_path.write_text(
+            f"interactive turn {len(self.prompt_texts)}\n{completion_marker}\n",
+            encoding="utf-8",
+        )
+        return TmuxTurnResult(
+            exit_code=0,
+            timed_out=False,
+            session_name=f"batonloop-{execution.name}-1",
+            pane_id="%1",
+            raw_log_path=self.raw_log_path,
+            attach_command="tmux attach fake",
+        )
+
+    def terminate(self, *, force: bool) -> None:
+        del force
+
+    def close(self, *, keep_sessions: bool) -> None:
+        self.close_keep_sessions = keep_sessions
 
 
 def _agent_message(text: str) -> str:

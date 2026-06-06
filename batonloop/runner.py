@@ -9,6 +9,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -19,6 +20,7 @@ from types import FrameType
 from .config import (
     OutputFormat,
     ProviderExecution,
+    ProviderMode,
     ProviderStrategy,
     RunnerConfig,
     resolve_provider_execution,
@@ -33,6 +35,7 @@ from .handoff import (
 from .live_output import LiveOutputConsumer
 from .providers.base import FailureDecision, Provider
 from .providers.utils import read_log_text
+from .tmux_session import TmuxSessionManager
 
 
 @dataclass(slots=True)
@@ -50,6 +53,10 @@ class CommandResult:
     exit_code: int
     timed_out: bool = False
     terminated_after_terminal_result: bool = False
+    tmux_session_name: str | None = None
+    tmux_pane_id: str | None = None
+    tmux_raw_log_path: Path | None = None
+    tmux_attach_command: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +92,11 @@ class IterationOutcome:
 
 
 _TERMINAL_STREAM_RESULT_GRACE_SECONDS = 1.0
+
+
+class _Terminable:
+    def terminate(self, *, force: bool) -> None:
+        raise NotImplementedError
 
 
 class _OutputPump(threading.Thread):
@@ -134,6 +146,7 @@ class StopController:
         self._logger = logger
         self.stop_requested = False
         self._current_process: subprocess.Popen[bytes] | None = None
+        self._current_terminable: _Terminable | None = None
         self._previous_int = None
         self._previous_term = None
 
@@ -155,6 +168,12 @@ class StopController:
     def detach_process(self) -> None:
         self._current_process = None
 
+    def attach_terminable(self, terminable: _Terminable) -> None:
+        self._current_terminable = terminable
+
+    def detach_terminable(self) -> None:
+        self._current_terminable = None
+
     def _handle_signal(self, signum: int, frame: FrameType | None) -> None:
         del signum, frame
         if not self.stop_requested:
@@ -170,12 +189,18 @@ class StopController:
         raise SystemExit(1)
 
     def _terminate_current_process(self) -> None:
+        if self._current_terminable is not None:
+            self._current_terminable.terminate(force=False)
+            return
         if self._current_process is None or self._current_process.poll() is not None:
             return
 
         _terminate_process_tree(self._current_process, force=False)
 
     def _force_terminate_current_process(self) -> None:
+        if self._current_terminable is not None:
+            self._current_terminable.terminate(force=True)
+            return
         if self._current_process is None or self._current_process.poll() is not None:
             return
 
@@ -203,6 +228,11 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
     state = RunState(start_time=time.monotonic())
     exit_status = 0
     current_provider_index = 0
+    tmux_manager = (
+        TmuxSessionManager(log_dir=config.log_dir)
+        if any(slot.execution.mode is ProviderMode.TMUX for slot in provider_slots)
+        else None
+    )
 
     controller.install()
     try:
@@ -265,6 +295,7 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 prompt_path=current_prompt,
                 resume_context=resume_context,
                 resume_note=iteration_resume_note,
+                tmux_manager=tmux_manager,
             )
             outcome = _handle_iteration_outcome(
                 logger=logger,
@@ -285,6 +316,10 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 base_prompt_path=iteration.prompt_path,
                 input_prompt_path=iteration.prompt_input_path,
                 output_format=config.output_format.value,
+                provider_mode=iteration.slot.execution.mode.value,
+                log_format=(
+                    "text" if iteration.slot.execution.mode is ProviderMode.TMUX else "json"
+                ),
                 exit_code=outcome.exit_code,
                 timed_out=iteration.result.timed_out,
                 success=outcome.success,
@@ -294,6 +329,10 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
                 failover_target_provider=outcome.failover_target_provider,
                 resume_context=resume_context,
                 resume_note=iteration_resume_note,
+                tmux_session_name=iteration.result.tmux_session_name,
+                tmux_pane_id=iteration.result.tmux_pane_id,
+                tmux_raw_log_path=iteration.result.tmux_raw_log_path,
+                tmux_attach_command=iteration.result.tmux_attach_command,
             )
 
             if outcome.success:
@@ -350,6 +389,8 @@ def run_loop(config: RunnerConfig, providers: Mapping[str, Provider]) -> int:
 
         return exit_status
     finally:
+        if tmux_manager is not None:
+            tmux_manager.close(keep_sessions=config.keep_tmux_sessions)
         controller.restore()
         _log_cleanup(logger, config, state)
 
@@ -415,6 +456,8 @@ def _build_provider_slots(
             raise ValueError(f"Unknown provider configured for this run: {provider_name}")
         execution = resolve_provider_execution(config, provider_name)
         provider.validate_config(config, execution)
+        if execution.mode is ProviderMode.TMUX:
+            _ensure_executable_available("tmux")
         _ensure_executable_available(provider.executable_name(execution))
         slots.append(ProviderSlot(provider=provider, execution=execution))
     return tuple(slots)
@@ -440,10 +483,11 @@ def _log_startup(
     )
     for index, slot in enumerate(provider_slots, start=1):
         logger.info(
-            "  [provider %s/%s] name=%s binary=%s model=%s max_turns=%s bare=%s safe=%s",
+            "  [provider %s/%s] name=%s mode=%s binary=%s model=%s max_turns=%s bare=%s safe=%s",
             index,
             len(provider_slots),
             slot.execution.name,
+            slot.execution.mode.value,
             slot.provider.executable_name(slot.execution),
             slot.execution.model or "default",
             slot.execution.max_turns if slot.execution.max_turns is not None else "unset",
@@ -477,6 +521,7 @@ def _log_startup(
     logger.info("Max errors:      %s", config.max_consecutive_errors)
     logger.info("Output format:   %s", config.output_format.value)
     logger.info("Live output:     %s", config.live_output)
+    logger.info("Keep tmux:       %s", config.keep_tmux_sessions)
     logger.info("Resume from:     %s", config.resume_from if config.resume_from else "none")
     logger.info("Resume note:     %s", config.resume_note or "none")
     logger.info("Log directory:   %s", config.log_dir)
@@ -546,6 +591,7 @@ def _execute_iteration(
     prompt_path: Path,
     resume_context: ResumeContext | None,
     resume_note: str | None,
+    tmux_manager: TmuxSessionManager | None,
 ) -> IterationExecution:
     logger.info(
         "--- Iteration %s starting with provider %s ---",
@@ -560,7 +606,16 @@ def _execute_iteration(
             prompt_path.name,
         )
 
-    iteration_log = config.log_dir / f"iteration-{iteration_number:06d}.json"
+    iteration_log = _iteration_log_path(
+        config.log_dir,
+        iteration_number=iteration_number,
+        mode=slot.execution.mode,
+    )
+    completion_marker = (
+        f"BATONLOOP_TURN_COMPLETE {uuid.uuid4()}"
+        if slot.execution.mode is ProviderMode.TMUX
+        else None
+    )
     prompt_input_path = _prepare_iteration_prompt(
         config=config,
         provider_execution=slot.execution,
@@ -568,6 +623,7 @@ def _execute_iteration(
         log_path=iteration_log,
         resume_context=resume_context,
         resume_note=resume_note,
+        completion_marker=completion_marker,
     )
     result = _run_iteration(
         provider=slot.provider,
@@ -576,6 +632,8 @@ def _execute_iteration(
         prompt_path=prompt_input_path,
         log_path=iteration_log,
         controller=controller,
+        tmux_manager=tmux_manager,
+        completion_marker=completion_marker,
     )
     logger.info("Exit code: %s", result.exit_code)
     if result.terminated_after_terminal_result:
@@ -640,9 +698,13 @@ def _handle_iteration_outcome(
         state.completed_iterations += 1
         logger.info("Iteration %s completed successfully.", iteration.number)
 
-        iteration_cost = iteration.slot.provider.extract_cost(
-            iteration.log_path,
-            config.output_format,
+        iteration_cost = (
+            Decimal("0")
+            if iteration.slot.execution.mode is ProviderMode.TMUX
+            else iteration.slot.provider.extract_cost(
+                iteration.log_path,
+                config.output_format,
+            )
         )
         if iteration_cost != 0:
             state.total_cost += iteration_cost
@@ -881,7 +943,23 @@ def _run_iteration(
     prompt_path: Path,
     log_path: Path,
     controller: StopController,
+    tmux_manager: TmuxSessionManager | None,
+    completion_marker: str | None,
 ) -> CommandResult:
+    if execution.mode is ProviderMode.TMUX:
+        if tmux_manager is None or completion_marker is None:
+            raise RuntimeError("tmux mode requires a tmux session manager and marker.")
+        return _run_tmux_iteration(
+            provider=provider,
+            execution=execution,
+            config=config,
+            prompt_path=prompt_path,
+            log_path=log_path,
+            controller=controller,
+            tmux_manager=tmux_manager,
+            completion_marker=completion_marker,
+        )
+
     command = provider.build_command(config, execution)
     return _run_subprocess(
         command=command,
@@ -899,6 +977,46 @@ def _run_iteration(
     )
 
 
+def _run_tmux_iteration(
+    *,
+    provider: Provider,
+    execution: ProviderExecution,
+    config: RunnerConfig,
+    prompt_path: Path,
+    log_path: Path,
+    controller: StopController,
+    tmux_manager: TmuxSessionManager,
+    completion_marker: str,
+) -> CommandResult:
+    logger = logging.getLogger("batonloop")
+    controller.attach_terminable(tmux_manager)
+    try:
+        result = tmux_manager.run_turn(
+            provider=provider,
+            execution=execution,
+            config=config,
+            prompt_path=prompt_path,
+            log_path=log_path,
+            completion_marker=completion_marker,
+            timeout_seconds=_timeout_seconds(config),
+            logger=logger,
+        )
+    except RuntimeError as exc:
+        log_path.write_text(f"tmux provider execution failed: {exc}\n", encoding="utf-8")
+        return CommandResult(exit_code=1)
+    finally:
+        controller.detach_terminable()
+
+    return CommandResult(
+        exit_code=result.exit_code,
+        timed_out=result.timed_out,
+        tmux_session_name=result.session_name,
+        tmux_pane_id=result.pane_id,
+        tmux_raw_log_path=result.raw_log_path,
+        tmux_attach_command=result.attach_command,
+    )
+
+
 def _prepare_iteration_prompt(
     *,
     config: RunnerConfig,
@@ -907,21 +1025,50 @@ def _prepare_iteration_prompt(
     log_path: Path,
     resume_context: ResumeContext | None,
     resume_note: str | None,
+    completion_marker: str | None,
 ) -> Path:
-    if resume_context is None:
+    if resume_context is None and completion_marker is None:
         return base_prompt_path
 
-    prompt_text = build_resume_prompt(
-        base_prompt_path=base_prompt_path,
-        current_provider_name=provider_execution.name,
-        working_dir=config.working_dir,
-        log_dir=config.log_dir,
-        resume_context=resume_context,
-        resume_note=resume_note,
-    )
+    if resume_context is None:
+        prompt_text = base_prompt_path.read_text(encoding="utf-8", errors="replace")
+    else:
+        prompt_text = build_resume_prompt(
+            base_prompt_path=base_prompt_path,
+            current_provider_name=provider_execution.name,
+            working_dir=config.working_dir,
+            log_dir=config.log_dir,
+            resume_context=resume_context,
+            resume_note=resume_note,
+        )
+
+    if completion_marker is not None:
+        prompt_text = _append_tmux_completion_control(prompt_text, completion_marker)
+
     prompt_artifact_path = prompt_artifact_path_for(log_path)
     prompt_artifact_path.write_text(prompt_text, encoding="utf-8")
     return prompt_artifact_path
+
+
+def _append_tmux_completion_control(prompt_text: str, completion_marker: str) -> str:
+    body = prompt_text.rstrip()
+    control = "\n".join(
+        [
+            "=== BATONLOOP CONTROL ===",
+            "When you are completely finished with this turn, end your final assistant message with this line exactly:",
+            completion_marker,
+            "Do not emit that line until all intended edits and verification for this turn are done.",
+            "=== END BATONLOOP CONTROL ===",
+        ]
+    )
+    if body:
+        return f"{body}\n\n{control}\n"
+    return f"{control}\n"
+
+
+def _iteration_log_path(log_dir: Path, *, iteration_number: int, mode: ProviderMode) -> Path:
+    suffix = ".log" if mode is ProviderMode.TMUX else ".json"
+    return log_dir / f"iteration-{iteration_number:06d}{suffix}"
 
 
 def _interruptible_sleep(seconds: int, controller: StopController) -> None:

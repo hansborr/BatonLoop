@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
-from ..config import OutputFormat, ProviderExecution, RunnerConfig
+from ..config import OutputFormat, ProviderExecution, ProviderMode, RunnerConfig
 from .base import FailureDecision, FailureKind
 from .utils import decimal_from_value, iter_jsonl, read_jsonl_failure_summary, read_log_text
 
@@ -16,10 +16,37 @@ class CodexProvider:
         return execution.binary or self.default_binary
 
     def validate_config(self, config: RunnerConfig, execution: ProviderExecution) -> None:
+        if execution.mode is ProviderMode.TMUX:
+            self.validate_interactive_config(config, execution)
+            return
         if config.output_format is not OutputFormat.STREAM_JSON:
             raise ValueError("Provider 'codex' only supports stream-json output.")
         if execution.max_turns is not None:
             raise ValueError("Provider 'codex' does not support --max-turns.")
+
+    def validate_interactive_config(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> None:
+        del config
+        if execution.max_turns is not None:
+            raise ValueError("Provider 'codex' does not support --max-turns in tmux mode.")
+        if execution.use_bare:
+            raise ValueError(
+                "Provider 'codex' does not support bare mode in tmux mode because "
+                "interactive codex does not expose --ignore-user-config/--ignore-rules."
+            )
+        _reject_interactive_args(
+            provider_name=self.name,
+            args=execution.extra_args,
+            unsupported={
+                "exec",
+                "--json",
+                "--ignore-user-config",
+                "--ignore-rules",
+            },
+        )
 
     def build_command(
         self,
@@ -49,6 +76,37 @@ class CodexProvider:
         command.extend(execution.extra_args)
 
         return command
+
+    def build_interactive_command(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> list[str]:
+        command = [
+            self.executable_name(execution),
+            "--no-alt-screen",
+            "-C",
+            str(config.working_dir),
+        ]
+
+        if execution.safe_mode:
+            command.append("--full-auto")
+        else:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+
+        if execution.model:
+            command.extend(["-m", execution.model])
+
+        command.extend(execution.extra_args)
+        return command
+
+    def interactive_environment(
+        self,
+        config: RunnerConfig,
+        execution: ProviderExecution,
+    ) -> dict[str, str]:
+        del config, execution
+        return {}
 
     def extract_cost(self, log_path: Path, output_format: OutputFormat) -> Decimal:
         del output_format
@@ -246,3 +304,17 @@ def _nested_lookup(payload: dict[str, object], *path: str) -> object | None:
             return None
         current = current[segment]
     return current
+
+
+def _reject_interactive_args(
+    *,
+    provider_name: str,
+    args: tuple[str, ...],
+    unsupported: set[str],
+) -> None:
+    for arg in args:
+        flag = arg.split("=", 1)[0]
+        if flag in unsupported:
+            raise ValueError(
+                f"Provider '{provider_name}' argument {arg!r} is not supported in tmux mode."
+            )

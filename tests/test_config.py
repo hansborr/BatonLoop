@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from batonloop.config import (
     OutputFormat,
+    ProviderMode,
     ProviderStrategy,
     build_config,
     parse_prompt_spec,
@@ -201,6 +202,34 @@ class PromptSpecTests(unittest.TestCase):
             self.assertTrue(resolve_provider_execution(config, "claude").safe_mode)
             self.assertEqual(resolve_provider_execution(config, "codex").model, "gpt-5.4")
             self.assertEqual(resolve_provider_execution(config, "codex").extra_args, ("--profile", "baton"))
+
+    def test_provider_mode_defaults_and_profile_override(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            prompt_path = temp_root / "PROMPT.md"
+            prompt_path.write_text("develop", encoding="utf-8")
+            run_config_path = temp_root / "batonloop.toml"
+            run_config_path.write_text(
+                "\n".join(
+                    [
+                        "[run]",
+                        'providers = ["claude", "codex"]',
+                        'provider_mode = "tmux"',
+                        "keep_tmux_sessions = true",
+                        "",
+                        "[providers.codex]",
+                        'mode = "exec"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("pathlib.Path.cwd", return_value=temp_root):
+                config = build_config(_make_args())
+
+            self.assertEqual(resolve_provider_execution(config, "claude").mode, ProviderMode.TMUX)
+            self.assertEqual(resolve_provider_execution(config, "codex").mode, ProviderMode.EXEC)
+            self.assertTrue(config.keep_tmux_sessions)
 
     def test_cli_values_override_run_config_toml(self) -> None:
         with TemporaryDirectory() as tmp_dir:
