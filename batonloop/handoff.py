@@ -1170,6 +1170,8 @@ def _clean_interactive_log_line(text: str) -> str | None:
     if lowered.startswith(
         (
             "when you are completely finished with this turn",
+            "marker prefix:",
+            "marker id:",
             "do not emit that line until",
         )
     ):

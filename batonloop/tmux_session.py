@@ -237,7 +237,7 @@ class TmuxSessionManager:
         started_at = time.monotonic()
         while True:
             chunk = _read_log_from_offset(session.raw_log_path, start_offset)
-            if completion_marker in _strip_terminal_control_sequences(chunk):
+            if _contains_completion_marker(chunk, completion_marker):
                 return 0, False
 
             if not self._pane_exists(session.pane_id):
@@ -329,3 +329,8 @@ def _strip_terminal_control_sequences(text: str) -> str:
     text = _ANSI_CSI_RE.sub("", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+
+
+def _contains_completion_marker(text: str, completion_marker: str) -> bool:
+    stripped = _strip_terminal_control_sequences(text)
+    return any(line.strip() == completion_marker for line in stripped.splitlines())

@@ -189,6 +189,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(len(FakeTmuxSessionManager.instances), 1)
             fake_manager = FakeTmuxSessionManager.instances[0]
             self.assertEqual(len(fake_manager.prompt_texts), 2)
+            self.assertEqual(len(fake_manager.completion_markers), 2)
+            self.assertNotIn(fake_manager.completion_markers[0], fake_manager.prompt_texts[0])
             self.assertEqual(fake_manager.close_keep_sessions, False)
 
     def test_stop_when_file_detects_marker(self) -> None:
@@ -1752,6 +1754,7 @@ class FakeTmuxSessionManager:
     def __init__(self, *, log_dir: Path) -> None:
         self.log_dir = log_dir
         self.prompt_texts: list[str] = []
+        self.completion_markers: list[str] = []
         self.close_keep_sessions: bool | None = None
         self.raw_log_path = log_dir / "tmux-fake.raw.log"
         self.raw_log_path.write_text("", encoding="utf-8")
@@ -1771,6 +1774,7 @@ class FakeTmuxSessionManager:
     ) -> TmuxTurnResult:
         del provider, config, timeout_seconds, logger
         self.prompt_texts.append(prompt_path.read_text(encoding="utf-8"))
+        self.completion_markers.append(completion_marker)
         log_path.write_text(
             f"interactive turn {len(self.prompt_texts)}\n{completion_marker}\n",
             encoding="utf-8",

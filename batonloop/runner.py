@@ -1052,11 +1052,13 @@ def _prepare_iteration_prompt(
 
 def _append_tmux_completion_control(prompt_text: str, completion_marker: str) -> str:
     body = prompt_text.rstrip()
+    marker_prefix, marker_id = completion_marker.split(" ", 1)
     control = "\n".join(
         [
             "=== BATONLOOP CONTROL ===",
-            "When you are completely finished with this turn, end your final assistant message with this line exactly:",
-            completion_marker,
+            "When you are completely finished with this turn, end your final assistant message with one line containing the marker prefix, one ASCII space, and the marker id.",
+            f"Marker prefix: {marker_prefix}",
+            f"Marker id: {marker_id}",
             "Do not emit that line until all intended edits and verification for this turn are done.",
             "=== END BATONLOOP CONTROL ===",
         ]
